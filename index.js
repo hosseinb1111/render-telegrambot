@@ -8,9 +8,13 @@
 //   2. Telegram secret header:
 //      X-Telegram-Bot-Api-Secret-Token
 //
-// Image model switching:
-//   - Normal text -> OPENROUTER_MODEL
-//   - Images      -> OPENROUTER_VISION_MODEL
+// Model routing:
+//   - Normal text requests -> OPENROUTER_MODEL
+//   - Image requests       -> OPENROUTER_VISION_MODEL
+//
+// Image MIME handling:
+//   - Never sends application/octet-stream to OpenRouter
+//   - Detects image type from Telegram's file_path
 //
 // ============================================================
 
@@ -46,7 +50,8 @@ import express from "express";
 // CONFIG
 // ============================================================
 
-const TELEGRAM_API = "https://api.telegram.org";
+const TELEGRAM_API =
+  "https://api.telegram.org";
 
 const OPENROUTER_API =
   "https://openrouter.ai/api/v1/chat/completions";
@@ -54,42 +59,55 @@ const OPENROUTER_API =
 const DEFAULT_MODEL =
   "minimax/minimax-m2.7:free";
 
-// Default model for image requests.
-// You can override this with OPENROUTER_VISION_MODEL.
 const DEFAULT_VISION_MODEL =
-  "google/gemini-2.5-flash";
+  "openrouter/free";
 
 // Telegram platform limits.
-const TELEGRAM_TEXT_LIMIT = 4096;
-const RICH_TEXT_LIMIT = 32768;
+const TELEGRAM_TEXT_LIMIT =
+  4096;
+
+const RICH_TEXT_LIMIT =
+  32768;
 
 // ------------------------------------------------------------
 // Live-streaming throttle
 // ------------------------------------------------------------
 
-const STREAM_EDIT_INTERVAL_MS = 1000;
+const STREAM_EDIT_INTERVAL_MS =
+  1000;
 
-const MIN_STREAM_EDIT_INTERVAL_MS = 700;
+const MIN_STREAM_EDIT_INTERVAL_MS =
+  700;
 
-const MIN_STREAM_NEW_CHARS = 30;
+const MIN_STREAM_NEW_CHARS =
+  30;
 
 // Switch from repeatedly editing one streaming message/draft to
 // chunked new-message delivery once the visible answer gets long.
-const SWITCH_TO_NEW_MESSAGES_AT = 3000;
+const SWITCH_TO_NEW_MESSAGES_AT =
+  3000;
 
 // Backoff for rate-limited streaming edits.
-const EDIT_BACKOFF_INITIAL_MS = 1000;
-const EDIT_BACKOFF_MAX_MS = 8000;
-const EDIT_FAILS_BEFORE_SWITCH = 3;
+const EDIT_BACKOFF_INITIAL_MS =
+  1000;
+
+const EDIT_BACKOFF_MAX_MS =
+  8000;
+
+const EDIT_FAILS_BEFORE_SWITCH =
+  3;
 
 // Per-read timeout for OpenRouter SSE streams.
-const SSE_CHUNK_TIMEOUT_MS = 15_000;
+const SSE_CHUNK_TIMEOUT_MS =
+  15_000;
 
 // Number of previous user/assistant pairs.
-const HISTORY_PAIRS = 2;
+const HISTORY_PAIRS =
+  2;
 
 // Webhook duplicate protection.
-const UPDATE_DEDUP_TTL_SECONDS = 300;
+const UPDATE_DEDUP_TTL_SECONDS =
+  300;
 
 // ------------------------------------------------------------
 // Web search (LangSearch) config
@@ -100,36 +118,54 @@ const LANGSEARCH_SEARCH_API =
 
 // Maximum number of actual LangSearch searches allowed per user
 // request.
-const MAX_WEB_SEARCHES = 3;
+const MAX_WEB_SEARCHES =
+  3;
 
 // Hard safety cap for model round-trips.
 const MAX_TOOL_LOOP_ITERATIONS =
   MAX_WEB_SEARCHES + 3;
 
-const MAX_SEARCH_RESULTS = 5;
+const MAX_SEARCH_RESULTS =
+  5;
 
-const MAX_RESULT_TITLE_LENGTH = 150;
+const MAX_RESULT_TITLE_LENGTH =
+  150;
 
-const MAX_RESULT_CONTENT_LENGTH = 500;
+const MAX_RESULT_CONTENT_LENGTH =
+  500;
 
 const WEB_SEARCH_TOOLS = [
   {
-    type: "function",
+    type:
+      "function",
+
     function: {
-      name: "web_search",
+      name:
+        "web_search",
+
       description:
         "Search the web for current, recent, factual, time-sensitive, or information that requires external verification. Use this tool when the answer cannot be reliably provided from existing knowledge or when up-to-date information is important.",
+
       parameters: {
-        type: "object",
+        type:
+          "object",
+
         properties: {
           query: {
-            type: "string",
+            type:
+              "string",
+
             description:
               "A concise, optimized web search query designed to find the most relevant and reliable information.",
           },
         },
-        required: ["query"],
-        additionalProperties: false,
+
+        required: [
+          "query",
+        ],
+
+        additionalProperties:
+          false,
       },
     },
   },
@@ -151,7 +187,8 @@ const TOOL_SYSTEM_INSTRUCTIONS =
 // GLOBAL CACHE
 // ============================================================
 
-let cachedBotUserId = null;
+let cachedBotUserId =
+  null;
 
 // ============================================================
 // IN-MEMORY KV STORE
@@ -159,11 +196,13 @@ let cachedBotUserId = null;
 
 class SimpleKV {
   constructor() {
-    this.store = new Map();
+    this.store =
+      new Map();
   }
 
   async get(key) {
-    const entry = this.store.get(key);
+    const entry =
+      this.store.get(key);
 
     if (!entry) {
       return null;
@@ -171,9 +210,13 @@ class SimpleKV {
 
     if (
       entry.expiresAt &&
-      Date.now() > entry.expiresAt
+      Date.now() >
+        entry.expiresAt
     ) {
-      this.store.delete(key);
+      this.store.delete(
+        key
+      );
+
       return null;
     }
 
@@ -189,7 +232,8 @@ class SimpleKV {
       options &&
       options.expirationTtl
         ? Date.now() +
-          options.expirationTtl * 1000
+          options.expirationTtl *
+            1000
         : null;
 
     this.store.set(
@@ -202,17 +246,22 @@ class SimpleKV {
   }
 
   sweep() {
-    const now = Date.now();
+    const now =
+      Date.now();
 
     for (
-      const [key, entry] of
-      this.store.entries()
+      const [
+        key,
+        entry,
+      ] of this.store.entries()
     ) {
       if (
         entry.expiresAt &&
         now > entry.expiresAt
       ) {
-        this.store.delete(key);
+        this.store.delete(
+          key
+        );
       }
     }
   }
@@ -250,8 +299,7 @@ const env = {
   OPENROUTER_MODEL:
     process.env.OPENROUTER_MODEL,
 
-  // NEW:
-  // Model used whenever an image is included in the request.
+  // Model used for image requests.
   OPENROUTER_VISION_MODEL:
     process.env.OPENROUTER_VISION_MODEL,
 
@@ -283,16 +331,7 @@ const env = {
 //
 // IMPORTANT:
 // Keep WEBHOOK_PATH_TOKEN stable.
-// Do NOT generate it using Math.random() on each restart,
-// otherwise Telegram's saved webhook URL would stop matching.
-//
-// Example:
-//
-// WEBHOOK_PATH_TOKEN=7d9a31f84b62c0e51a8f93d72c46e105c8b71f4
-//
-// Final URL:
-//
-// /webhook/7d9a31f84b62c0e51a8f93d72c46e105c8b71f4
+// Do NOT generate it using Math.random() on each restart.
 //
 // ============================================================
 
@@ -313,7 +352,9 @@ if (!env.BOT_TOKEN) {
   );
 }
 
-if (!env.OPENROUTER_API_KEY) {
+if (
+  !env.OPENROUTER_API_KEY
+) {
   console.error(
     "Missing required env var: OPENROUTER_API_KEY"
   );
@@ -335,8 +376,9 @@ if (!env.WEBHOOK_PATH_TOKEN) {
 }
 
 console.log(
-  "Default text model:",
-  DEFAULT_MODEL
+  "Text model:",
+  env.OPENROUTER_MODEL ||
+    DEFAULT_MODEL
 );
 
 console.log(
@@ -349,11 +391,13 @@ console.log(
 // EXPRESS SERVER
 // ============================================================
 
-const app = express();
+const app =
+  express();
 
 app.use(
   express.json({
-    limit: "1mb",
+    limit:
+      "1mb",
   })
 );
 
@@ -366,32 +410,19 @@ app.get(
   (req, res) => {
     res
       .status(200)
-      .send("AI Bot Running");
+      .send(
+        "AI Bot Running"
+      );
   }
 );
 
 // ============================================================
 // SECURE TELEGRAM WEBHOOK
 // ============================================================
-//
-// Telegram POSTs here.
-//
-// Security has TWO layers:
-//
-// 1. Secret/random URL path
-// 2. Telegram's secret header
-//
-// ============================================================
 
 app.post(
   WEBHOOK_PATH,
   async (req, res) => {
-    // --------------------------------------------------------
-    // Verify Telegram secret header.
-    //
-    // DO NOT log actual secret values.
-    // --------------------------------------------------------
-
     const providedSecret =
       req.get(
         "X-Telegram-Bot-Api-Secret-Token"
@@ -401,6 +432,7 @@ app.post(
       env.WEBHOOK_SECRET;
 
     // Safe diagnostics.
+    // Never log the actual secret.
     console.log(
       "========== TELEGRAM WEBHOOK =========="
     );
@@ -451,10 +483,6 @@ app.post(
       secretMatches
     );
 
-    // --------------------------------------------------------
-    // Secret must exist.
-    // --------------------------------------------------------
-
     if (!expectedSecret) {
       console.error(
         "WEBHOOK_SECRET is not configured. " +
@@ -469,10 +497,6 @@ app.post(
 
       return;
     }
-
-    // --------------------------------------------------------
-    // Secret must match.
-    // --------------------------------------------------------
 
     if (!secretMatches) {
       console.warn(
@@ -492,10 +516,6 @@ app.post(
     console.log(
       "Webhook authentication: SUCCESS"
     );
-
-    // --------------------------------------------------------
-    // Telegram update
-    // --------------------------------------------------------
 
     const update =
       req.body;
@@ -578,7 +598,9 @@ app.post(
     ) {
       res
         .status(404)
-        .send("Not found");
+        .send(
+          "Not found"
+        );
 
       return;
     }
@@ -594,7 +616,9 @@ app.post(
     ) {
       res
         .status(401)
-        .send("Unauthorized");
+        .send(
+          "Unauthorized"
+        );
 
       return;
     }
@@ -784,7 +808,7 @@ async function processUpdate(
           `${triggerCommand} your question`,
           "or reply to one of my messages.",
           "",
-          "Images are supported when the selected vision model supports image input.",
+          "Images are supported.",
           "",
           "Streaming: ON",
           "Text Model: `" +
@@ -799,7 +823,9 @@ async function processUpdate(
                 DEFAULT_VISION_MODEL
             ) +
             "`",
-        ].join("\n"),
+        ].join(
+          "\n"
+        ),
         messageId
       );
 
@@ -835,7 +861,8 @@ async function processUpdate(
       false;
 
     let prompt =
-      text || caption;
+      text ||
+      caption;
 
     let isImage =
       false;
@@ -848,7 +875,8 @@ async function processUpdate(
       photos &&
       photos.length > 0
     ) {
-      isImage = true;
+      isImage =
+        true;
 
       if (isPrivate) {
         shouldReply =
@@ -1038,7 +1066,9 @@ async function handleStart(
         "or reply to one of my messages.",
         "",
         "Creator: @Hose3in",
-      ].join("\n"),
+      ].join(
+        "\n"
+      ),
       replyToMessageId
     );
 
@@ -1069,6 +1099,26 @@ async function generateAI(
     "========== AI GENERATION =========="
   );
 
+  console.log(
+    "Request contains image:",
+    Boolean(
+      imageData
+    )
+  );
+
+  console.log(
+    "Selected model:",
+    imageData
+      ? (
+          env.OPENROUTER_VISION_MODEL ||
+          DEFAULT_VISION_MODEL
+        )
+      : (
+          env.OPENROUTER_MODEL ||
+          DEFAULT_MODEL
+        )
+  );
+
   // ----------------------------------------------------------
   // STREAM STATE
   // ----------------------------------------------------------
@@ -1089,11 +1139,20 @@ async function generateAI(
     [];
 
   const groupStreamState = {
-    mode: "edit",
-    editBackoffMs: 0,
-    editBackoffUntil: 0,
-    consecutiveEditFails: 0,
-    newModeSentLength: 0,
+    mode:
+      "edit",
+
+    editBackoffMs:
+      0,
+
+    editBackoffUntil:
+      0,
+
+    consecutiveEditFails:
+      0,
+
+    newModeSentLength:
+      0,
   };
 
   let usingRichDraft =
@@ -1168,7 +1227,9 @@ async function generateAI(
             "OpenRouter SSE read failed/timeout:",
             error instanceof Error
               ? error.message
-              : String(error)
+              : String(
+                  error
+                )
           );
 
           try {
@@ -1193,7 +1254,8 @@ async function generateAI(
           decoder.decode(
             result.value,
             {
-              stream: true,
+              stream:
+                true,
             }
           );
 
@@ -1203,7 +1265,8 @@ async function generateAI(
           );
 
         sseBuffer =
-          lines.pop() || "";
+          lines.pop() ||
+          "";
 
         for (
           const rawLine of
@@ -1264,9 +1327,9 @@ async function generateAI(
             continue;
           }
 
-          // --------------------------------------------------
+          // ----------------------------------------------------
           // Tool calls
-          // --------------------------------------------------
+          // ----------------------------------------------------
 
           if (
             Array.isArray(
@@ -1279,9 +1342,9 @@ async function generateAI(
             );
           }
 
-          // --------------------------------------------------
+          // ----------------------------------------------------
           // Reasoning
-          // --------------------------------------------------
+          // ----------------------------------------------------
 
           const hasReasoning =
             Boolean(
@@ -1314,9 +1377,9 @@ async function generateAI(
             }
           }
 
-          // --------------------------------------------------
+          // ----------------------------------------------------
           // Content
-          // --------------------------------------------------
+          // ----------------------------------------------------
 
           const content =
             extractContent(
@@ -1330,9 +1393,9 @@ async function generateAI(
           fullAnswer +=
             content;
 
-          // --------------------------------------------------
+          // ----------------------------------------------------
           // STREAM THROTTLE
-          // --------------------------------------------------
+          // ----------------------------------------------------
 
           const now =
             Date.now();
@@ -1357,9 +1420,9 @@ async function generateAI(
           lastEditChars =
             fullAnswer.length;
 
-          // ==================================================
+          // ====================================================
           // PRIVATE — RICH DRAFT
-          // ==================================================
+          // ====================================================
 
           if (usingRichDraft) {
             const liveText =
@@ -1394,13 +1457,13 @@ async function generateAI(
             continue;
           }
 
-          // ==================================================
+          // ====================================================
           // GROUP — STREAM
-          // ==================================================
+          // ====================================================
 
           if (
             streamMessageIds.length >
-              0
+            0
           ) {
             if (
               fullAnswer !==
@@ -1432,6 +1495,7 @@ async function generateAI(
         toolCallAccumulator.filter(
           Boolean
         ),
+
       finishReason,
     };
   }
@@ -1441,7 +1505,9 @@ async function generateAI(
   // ----------------------------------------------------------
 
   async function showSearchingStatus() {
-    if (usingRichDraft) {
+    if (
+      usingRichDraft
+    ) {
       lastDraftAt =
         Date.now();
 
@@ -1474,7 +1540,9 @@ async function generateAI(
     // PRIVATE CHAT
     // ========================================================
 
-    if (isPrivate) {
+    if (
+      isPrivate
+    ) {
       const richDraftResult =
         await sendRichMessageDraft(
           token,
@@ -1597,10 +1665,8 @@ async function generateAI(
           : null;
 
       // ------------------------------------------------------
-      // NEW:
-      // Pass whether this request contains an image.
-      // This lets createOpenRouterRequest choose the vision
-      // model automatically.
+      // IMPORTANT:
+      // Select vision model automatically when imageData exists.
       // ------------------------------------------------------
 
       const response =
@@ -1609,7 +1675,9 @@ async function generateAI(
           currentMessages,
           true,
           toolsForThisRound,
-          Boolean(imageData)
+          Boolean(
+            imageData
+          )
         );
 
       console.log(
@@ -1831,7 +1899,9 @@ async function generateAI(
     // PRIVATE CHAT
     // ========================================================
 
-    if (usingRichDraft) {
+    if (
+      usingRichDraft
+    ) {
       await sendFinalRichResponse(
         token,
         chatId,
@@ -1878,7 +1948,9 @@ async function generateAI(
     // PRIVATE ERROR
     // --------------------------------------------------------
 
-    if (usingRichDraft) {
+    if (
+      usingRichDraft
+    ) {
       try {
         await sendFinalRichResponse(
           token,
@@ -1887,7 +1959,9 @@ async function generateAI(
             (
               error instanceof Error
                 ? error.message
-                : String(error)
+                : String(
+                    error
+                  )
             ),
           replyToMessageId
         );
@@ -1914,7 +1988,9 @@ async function generateAI(
         (
           error instanceof Error
             ? error.message
-            : String(error)
+            : String(
+                error
+              )
         );
 
       try {
@@ -1968,7 +2044,8 @@ async function syncGroupStream(
   const streamState =
     state ||
     {
-      mode: "edit",
+      mode:
+        "edit",
 
       editBackoffMs:
         0,
@@ -2049,7 +2126,6 @@ async function syncGroupStream(
   const lastIndex =
     parts.length - 1;
 
-  // Ensure current page exists.
   if (
     streamMessageIds[
       lastIndex
@@ -2135,7 +2211,6 @@ async function syncGroupStream(
           ? streamState.editBackoffMs *
               2
           : EDIT_BACKOFF_INITIAL_MS,
-
         EDIT_BACKOFF_MAX_MS
       );
 
@@ -2143,7 +2218,6 @@ async function syncGroupStream(
       Math.min(
         retryAfter *
           1000,
-
         EDIT_BACKOFF_MAX_MS
       );
 
@@ -2176,10 +2250,6 @@ async function syncGroupStream(
 
     return;
   }
-
-  // ----------------------------------------------------------
-  // Non-429 fallback
-  // ----------------------------------------------------------
 
   const markdownEdited =
     await editMarkdownMessage(
@@ -2240,7 +2310,9 @@ async function switchGroupStreamToNewMessages(
 ) {
   for (
     const messageId of
-    streamMessageIds.splice(0)
+    streamMessageIds.splice(
+      0
+    )
   ) {
     await safeDeleteMessage(
       token,
@@ -2361,7 +2433,9 @@ async function appendNewModeStream(
       );
     }
 
-    await sleep(50);
+    await sleep(
+      50
+    );
   }
 
   state.newModeSentLength =
@@ -2650,7 +2724,7 @@ async function sendRichMessage(
     };
   }
 
-  return telegramPost(
+  return await telegramPost(
     token,
     "sendRichMessage",
     body
@@ -2689,7 +2763,7 @@ async function sendRichMessageDraft(
       messageThreadId;
   }
 
-  return telegramPost(
+  return await telegramPost(
     token,
     "sendRichMessageDraft",
     body
@@ -2706,7 +2780,7 @@ async function editRichMessage(
   messageId,
   markdownText
 ) {
-  return telegramPost(
+  return await telegramPost(
     token,
     "editMessageText",
     {
@@ -2765,7 +2839,7 @@ async function sendMessage(
   if (
     !result.ok
   ) {
-    return sendPlainMessage(
+    return await sendPlainMessage(
       token,
       chatId,
       text,
@@ -2804,7 +2878,7 @@ async function sendPlainMessage(
       replyToMessageId;
   }
 
-  return telegramPost(
+  return await telegramPost(
     token,
     "sendMessage",
     body
@@ -2822,7 +2896,7 @@ async function editMarkdownMessage(
   text,
   skipRateLimitRetry = false
 ) {
-  return telegramPost(
+  return await telegramPost(
     token,
     "editMessageText",
     {
@@ -2854,7 +2928,7 @@ async function editPlainMessage(
   text,
   skipRateLimitRetry = false
 ) {
-  return telegramPost(
+  return await telegramPost(
     token,
     "editMessageText",
     {
@@ -2884,6 +2958,7 @@ async function sendNewMessage(
   toRichHtml,
   replyToMessageId
 ) {
+  // The bot uses Telegram Rich Message markdown directly.
   if (useRich) {
     const result =
       await sendRichMessage(
@@ -2900,7 +2975,7 @@ async function sendNewMessage(
       return result;
     }
 
-    return sendPlainMessage(
+    return await sendPlainMessage(
       token,
       chatId,
       text,
@@ -2908,7 +2983,7 @@ async function sendNewMessage(
     );
   }
 
-  return sendPlainMessage(
+  return await sendPlainMessage(
     token,
     chatId,
     text,
@@ -3169,10 +3244,11 @@ async function telegramPost(
         );
 
         await sleep(
-          waitSeconds * 1000
+          waitSeconds *
+            1000
         );
 
-        return telegramPost(
+        return await telegramPost(
           token,
           method,
           body,
@@ -3194,7 +3270,9 @@ async function telegramPost(
         false,
 
       description:
-        String(error),
+        String(
+          error
+        ),
     };
   }
 }
@@ -3255,7 +3333,7 @@ async function sendTyping(
   token,
   chatId
 ) {
-  return telegramPost(
+  return await telegramPost(
     token,
     "sendChatAction",
     {
@@ -3342,13 +3420,79 @@ async function downloadImage(
   const buffer =
     await response.arrayBuffer();
 
-  const mimeType =
-    response.headers.get(
-      "content-type"
-    ) ||
+  // ==========================================================
+  // IMPORTANT MIME FIX
+  // ==========================================================
+  //
+  // Some proxies/hosting environments return:
+  //
+  //   application/octet-stream
+  //
+  // even though the actual downloaded file is an image.
+  //
+  // OpenRouter does not accept:
+  //
+  //   data:application/octet-stream;base64,...
+  //
+  // So we ONLY accept known image MIME types from the HTTP
+  // response. Otherwise we use Telegram's file extension.
+  //
+  // ==========================================================
+
+  const headerMimeType =
+    (
+      response.headers.get(
+        "content-type"
+      ) || ""
+    )
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
+
+  const detectedMimeType =
     detectImageMimeType(
       filePath
     );
+
+  const supportedMimeTypes =
+    new Set([
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+      "image/gif",
+    ]);
+
+  const mimeType =
+    supportedMimeTypes.has(
+      headerMimeType
+    )
+      ? headerMimeType
+      : detectedMimeType;
+
+  console.log(
+    "Image MIME diagnostics:",
+    {
+      filePath,
+
+      headerMimeType,
+
+      detectedMimeType,
+
+      selectedMimeType:
+        mimeType,
+    }
+  );
+
+  if (
+    !supportedMimeTypes.has(
+      mimeType
+    )
+  ) {
+    throw new Error(
+      `Unsupported image MIME type: ${mimeType}. ` +
+        `Telegram file path: ${filePath}`
+    );
+  }
 
   return {
     base64:
@@ -3375,6 +3519,17 @@ function detectImageMimeType(
 
   if (
     value.endsWith(
+      ".jpg"
+    ) ||
+    value.endsWith(
+      ".jpeg"
+    )
+  ) {
+    return "image/jpeg";
+  }
+
+  if (
+    value.endsWith(
       ".png"
     )
   ) {
@@ -3397,6 +3552,8 @@ function detectImageMimeType(
     return "image/gif";
   }
 
+  // Telegram photos are normally JPEG even if some intermediary
+  // returns application/octet-stream.
   return "image/jpeg";
 }
 
@@ -3515,23 +3672,12 @@ async function buildMessages(
 // OPENROUTER
 // ============================================================
 //
-// IMPORTANT CHANGE:
+// IMPORTANT:
+// hasImage = true
+//     -> OPENROUTER_VISION_MODEL
 //
-// createOpenRouterRequest now accepts:
-//
-//   hasImage = false
-//
-// If hasImage is true:
-//
-//   env.OPENROUTER_VISION_MODEL
-//
-// is selected.
-//
-// Otherwise:
-//
-//   env.OPENROUTER_MODEL
-//
-// is selected.
+// hasImage = false
+//     -> OPENROUTER_MODEL
 //
 // ============================================================
 
@@ -3551,9 +3697,9 @@ async function createOpenRouterRequest(
     );
   }
 
-  // ==========================================================
-  // IMAGE MODEL SWITCH
-  // ==========================================================
+  // ----------------------------------------------------------
+  // MODEL SELECTION
+  // ----------------------------------------------------------
 
   const model =
     hasImage
@@ -3566,9 +3712,9 @@ async function createOpenRouterRequest(
           DEFAULT_MODEL
         );
 
-  // ==========================================================
-  // REQUEST BODY
-  // ==========================================================
+  // ----------------------------------------------------------
+  // BODY
+  // ----------------------------------------------------------
 
   const body = {
     model:
@@ -3592,9 +3738,9 @@ async function createOpenRouterRequest(
       "auto";
   }
 
-  // ==========================================================
+  // ----------------------------------------------------------
   // HEADERS
-  // ==========================================================
+  // ----------------------------------------------------------
 
   const headers = {
     Authorization:
@@ -3622,9 +3768,9 @@ async function createOpenRouterRequest(
       env.OPENROUTER_X_TITLE;
   }
 
-  // ==========================================================
-  // SAFE DIAGNOSTIC
-  // ==========================================================
+  // ----------------------------------------------------------
+  // LOG
+  // ----------------------------------------------------------
 
   console.log(
     "OpenRouter request:",
@@ -3646,11 +3792,11 @@ async function createOpenRouterRequest(
     }
   );
 
-  // ==========================================================
+  // ----------------------------------------------------------
   // REQUEST
-  // ==========================================================
+  // ----------------------------------------------------------
 
-  return fetch(
+  return await fetch(
     OPENROUTER_API,
     {
       method:
@@ -4058,7 +4204,6 @@ async function handleGuestMode(
         ? WEB_SEARCH_TOOLS
         : null;
 
-    // Guest mode is text-only here, so hasImage stays false.
     const response =
       await createOpenRouterRequest(
         env,
@@ -4285,7 +4430,9 @@ function splitText(
     value.length <=
     limit
   ) {
-    return [value];
+    return [
+      value,
+    ];
   }
 
   const parts =
@@ -4303,10 +4450,6 @@ function splitText(
         start + limit,
         value.length
       );
-
-    // --------------------------------------------------------
-    // Prefer a newline boundary.
-    // --------------------------------------------------------
 
     if (
       end <
@@ -4759,47 +4902,5 @@ async function saveConversation(
 }
 
 // ============================================================
-// ARRAY BUFFER -> BASE64
+// END
 // ============================================================
-
-function arrayBufferToBase64(
-  buffer
-) {
-  const bytes =
-    new Uint8Array(
-      buffer
-    );
-
-  let binary =
-    "";
-
-  const chunkSize =
-    0x8000;
-
-  for (
-    let i = 0;
-    i < bytes.length;
-    i += chunkSize
-  ) {
-    const chunk =
-      bytes.subarray(
-        i,
-        Math.min(
-          i + chunkSize,
-          bytes.length
-        )
-      );
-
-    binary +=
-      String.fromCharCode(
-        ...chunk
-      );
-  }
-
-  return Buffer.from(
-    binary,
-    "binary"
-  ).toString(
-    "base64"
-  );
-}
