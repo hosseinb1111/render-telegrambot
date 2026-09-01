@@ -8,6 +8,10 @@
 //   2. Telegram secret header:
 //      X-Telegram-Bot-Api-Secret-Token
 //
+// Image model switching:
+//   - Normal text -> OPENROUTER_MODEL
+//   - Images      -> OPENROUTER_VISION_MODEL
+//
 // ============================================================
 
 // ============================================================
@@ -27,6 +31,7 @@
 // TRIGGER_COMMAND
 // SYSTEM_PROMPT
 // OPENROUTER_MODEL
+// OPENROUTER_VISION_MODEL
 // OPENROUTER_HTTP_REFERER
 // OPENROUTER_X_TITLE
 // LANGSEARCH_API_KEY
@@ -48,6 +53,11 @@ const OPENROUTER_API =
 
 const DEFAULT_MODEL =
   "minimax/minimax-m2.7:free";
+
+// Default model for image requests.
+// You can override this with OPENROUTER_VISION_MODEL.
+const DEFAULT_VISION_MODEL =
+  "google/gemini-2.5-flash";
 
 // Telegram platform limits.
 const TELEGRAM_TEXT_LIMIT = 4096;
@@ -240,6 +250,11 @@ const env = {
   OPENROUTER_MODEL:
     process.env.OPENROUTER_MODEL,
 
+  // NEW:
+  // Model used whenever an image is included in the request.
+  OPENROUTER_VISION_MODEL:
+    process.env.OPENROUTER_VISION_MODEL,
+
   OPENROUTER_HTTP_REFERER:
     process.env.OPENROUTER_HTTP_REFERER,
 
@@ -318,6 +333,17 @@ if (!env.WEBHOOK_PATH_TOKEN) {
       "Set WEBHOOK_PATH_TOKEN in the environment."
   );
 }
+
+console.log(
+  "Default text model:",
+  DEFAULT_MODEL
+);
+
+console.log(
+  "Vision model:",
+  env.OPENROUTER_VISION_MODEL ||
+    DEFAULT_VISION_MODEL
+);
 
 // ============================================================
 // EXPRESS SERVER
@@ -758,13 +784,19 @@ async function processUpdate(
           `${triggerCommand} your question`,
           "or reply to one of my messages.",
           "",
-          "Images are supported when the selected free model supports vision.",
+          "Images are supported when the selected vision model supports image input.",
           "",
           "Streaming: ON",
-          "Model: `" +
+          "Text Model: `" +
             escapeMarkdown(
               env.OPENROUTER_MODEL ||
                 DEFAULT_MODEL
+            ) +
+            "`",
+          "Vision Model: `" +
+            escapeMarkdown(
+              env.OPENROUTER_VISION_MODEL ||
+                DEFAULT_VISION_MODEL
             ) +
             "`",
         ].join("\n"),
@@ -980,6 +1012,10 @@ async function handleStart(
     env.OPENROUTER_MODEL ||
     DEFAULT_MODEL;
 
+  const visionModel =
+    env.OPENROUTER_VISION_MODEL ||
+    DEFAULT_VISION_MODEL;
+
   const result =
     await sendMessage(
       token,
@@ -989,7 +1025,8 @@ async function handleStart(
         "",
         "Welcome!",
         "",
-        `Model: \`${escapeMarkdown(model)}\``,
+        `Text Model: \`${escapeMarkdown(model)}\``,
+        `Vision Model: \`${escapeMarkdown(visionModel)}\``,
         "Provider: OpenRouter",
         "⚡ Live streaming: ON",
         "",
@@ -1559,12 +1596,20 @@ async function generateAI(
           ? WEB_SEARCH_TOOLS
           : null;
 
+      // ------------------------------------------------------
+      // NEW:
+      // Pass whether this request contains an image.
+      // This lets createOpenRouterRequest choose the vision
+      // model automatically.
+      // ------------------------------------------------------
+
       const response =
         await createOpenRouterRequest(
           env,
           currentMessages,
           true,
-          toolsForThisRound
+          toolsForThisRound,
+          Boolean(imageData)
         );
 
       console.log(
@@ -1575,7 +1620,13 @@ async function generateAI(
             Boolean(
               toolsForThisRound
             ),
+
           searchRoundsUsed,
+
+          hasImage:
+            Boolean(
+              imageData
+            ),
         }
       );
 
@@ -1632,10 +1683,16 @@ async function generateAI(
           }
 
           assistantToolCalls.push({
-            id: call.id,
-            type: "function",
+            id:
+              call.id,
+
+            type:
+              "function",
+
             function: {
-              name: "web_search",
+              name:
+                "web_search",
+
               arguments:
                 call.function
                   .arguments ||
@@ -1703,9 +1760,12 @@ async function generateAI(
           }
 
           toolResultMessages.push({
-            role: "tool",
+            role:
+              "tool",
+
             tool_call_id:
               call.id,
+
             content:
               toolResultText,
           });
@@ -1729,13 +1789,17 @@ async function generateAI(
           currentMessages.concat(
             [
               {
-                role: "assistant",
+                role:
+                  "assistant",
+
                 content:
                   fullAnswer,
+
                 tool_calls:
                   assistantToolCalls,
               },
             ],
+
             toolResultMessages
           );
 
@@ -1905,10 +1969,18 @@ async function syncGroupStream(
     state ||
     {
       mode: "edit",
-      editBackoffMs: 0,
-      editBackoffUntil: 0,
-      consecutiveEditFails: 0,
-      newModeSentLength: 0,
+
+      editBackoffMs:
+        0,
+
+      editBackoffUntil:
+        0,
+
+      consecutiveEditFails:
+        0,
+
+      newModeSentLength:
+        0,
     };
 
   const parts =
@@ -1918,7 +1990,8 @@ async function syncGroupStream(
     );
 
   if (
-    parts.length === 0
+    parts.length ===
+    0
   ) {
     return;
   }
@@ -1980,7 +2053,8 @@ async function syncGroupStream(
   if (
     streamMessageIds[
       lastIndex
-    ] === undefined
+    ] ===
+    undefined
   ) {
     const part =
       parts[lastIndex];
@@ -2049,7 +2123,8 @@ async function syncGroupStream(
     );
 
   if (
-    retryAfter !== null
+    retryAfter !==
+    null
   ) {
     streamState.consecutiveEditFails++;
 
@@ -2060,12 +2135,15 @@ async function syncGroupStream(
           ? streamState.editBackoffMs *
               2
           : EDIT_BACKOFF_INITIAL_MS,
+
         EDIT_BACKOFF_MAX_MS
       );
 
     const retryAfterMs =
       Math.min(
-        retryAfter * 1000,
+        retryAfter *
+          1000,
+
         EDIT_BACKOFF_MAX_MS
       );
 
@@ -2210,7 +2288,9 @@ async function appendNewModeStream(
   replyToMessageId
 ) {
   const text =
-    String(fullText || "");
+    String(
+      fullText || ""
+    );
 
   const previousLength =
     state.newModeSentLength ||
@@ -2307,7 +2387,8 @@ async function finalizeGroupMessages(
     );
 
   if (
-    parts.length === 0
+    parts.length ===
+    0
   ) {
     return;
   }
@@ -2895,7 +2976,9 @@ async function appendChunk(
       );
     }
 
-    await sleep(50);
+    await sleep(
+      50
+    );
   }
 
   return fullText.length;
@@ -2915,7 +2998,9 @@ async function sendChunked(
       : TELEGRAM_TEXT_LIMIT;
 
   const text =
-    String(fullText || "");
+    String(
+      fullText || ""
+    );
 
   if (!text) {
     return;
@@ -2956,7 +3041,9 @@ async function sendChunked(
       );
     }
 
-    await sleep(50);
+    await sleep(
+      50
+    );
   }
 }
 
@@ -3281,23 +3368,31 @@ function detectImageMimeType(
   path
 ) {
   const value =
-    String(path || "")
+    String(
+      path || ""
+    )
       .toLowerCase();
 
   if (
-    value.endsWith(".png")
+    value.endsWith(
+      ".png"
+    )
   ) {
     return "image/png";
   }
 
   if (
-    value.endsWith(".webp")
+    value.endsWith(
+      ".webp"
+    )
   ) {
     return "image/webp";
   }
 
   if (
-    value.endsWith(".gif")
+    value.endsWith(
+      ".gif"
+    )
   ) {
     return "image/gif";
   }
@@ -3419,12 +3514,33 @@ async function buildMessages(
 // ============================================================
 // OPENROUTER
 // ============================================================
+//
+// IMPORTANT CHANGE:
+//
+// createOpenRouterRequest now accepts:
+//
+//   hasImage = false
+//
+// If hasImage is true:
+//
+//   env.OPENROUTER_VISION_MODEL
+//
+// is selected.
+//
+// Otherwise:
+//
+//   env.OPENROUTER_MODEL
+//
+// is selected.
+//
+// ============================================================
 
 async function createOpenRouterRequest(
   env,
   messages,
   stream,
-  tools
+  tools,
+  hasImage = false
 ) {
   const apiKey =
     env.OPENROUTER_API_KEY;
@@ -3435,9 +3551,24 @@ async function createOpenRouterRequest(
     );
   }
 
+  // ==========================================================
+  // IMAGE MODEL SWITCH
+  // ==========================================================
+
   const model =
-    env.OPENROUTER_MODEL ||
-    DEFAULT_MODEL;
+    hasImage
+      ? (
+          env.OPENROUTER_VISION_MODEL ||
+          DEFAULT_VISION_MODEL
+        )
+      : (
+          env.OPENROUTER_MODEL ||
+          DEFAULT_MODEL
+        );
+
+  // ==========================================================
+  // REQUEST BODY
+  // ==========================================================
 
   const body = {
     model:
@@ -3460,6 +3591,10 @@ async function createOpenRouterRequest(
     body.tool_choice =
       "auto";
   }
+
+  // ==========================================================
+  // HEADERS
+  // ==========================================================
 
   const headers = {
     Authorization:
@@ -3487,6 +3622,10 @@ async function createOpenRouterRequest(
       env.OPENROUTER_X_TITLE;
   }
 
+  // ==========================================================
+  // SAFE DIAGNOSTIC
+  // ==========================================================
+
   console.log(
     "OpenRouter request:",
     {
@@ -3496,6 +3635,9 @@ async function createOpenRouterRequest(
       stream:
         stream,
 
+      hasImage:
+        hasImage,
+
       tools:
         Boolean(
           tools &&
@@ -3503,6 +3645,10 @@ async function createOpenRouterRequest(
         ),
     }
   );
+
+  // ==========================================================
+  // REQUEST
+  // ==========================================================
 
   return fetch(
     OPENROUTER_API,
@@ -3714,7 +3860,9 @@ function formatSearchResultsForModel(
   }
 
   return lines
-    .join("\n")
+    .join(
+      "\n"
+    )
     .trim();
 }
 
@@ -3910,12 +4058,14 @@ async function handleGuestMode(
         ? WEB_SEARCH_TOOLS
         : null;
 
+    // Guest mode is text-only here, so hasImage stays false.
     const response =
       await createOpenRouterRequest(
         env,
         messages,
         false,
-        toolsForThisRound
+        toolsForThisRound,
+        false
       );
 
     if (
@@ -4653,7 +4803,3 @@ function arrayBufferToBase64(
     "base64"
   );
 }
-
-// ============================================================
-// END
-// ============================================================
