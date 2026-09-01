@@ -1,39 +1,23 @@
 // ============================================================
 // TELEGRAM AI BOT
-// Render (Node.js / Express) + OpenRouter + LangSearch Web Search
+// Render / Abasthan (Node.js / Express) + OpenRouter + LangSearch
 // Production JavaScript
 //
-// ============================================================
-// This is a Render-compatible port of a Cloudflare Workers bot.
-// Changes from the original Workers version:
-//   - Cloudflare's `export default { fetch, queue }` module is
-//     replaced with a plain Express HTTP server exposing
-//     POST /webhook (Telegram sends updates here) and GET / for
-//     health checks.
-//   - Cloudflare KV (env.CHAT_HISTORY) is replaced with an
-//     in-memory Map-based store (SimpleKV). This means chat
-//     history / dedup state resets whenever the Render service
-//     restarts or redeploys. That's fine for a single bot
-//     instance; if you need persistence across restarts, swap
-//     SimpleKV for a Redis-backed implementation (see README).
-//   - Cloudflare Queues (env.BOT_QUEUE) are removed. Render has
-//     no equivalent primitive; updates are processed directly,
-//     fire-and-forget, right after acknowledging Telegram.
-//   - ctx.waitUntil() is removed; Express just responds 200
-//     immediately and processes the update asynchronously.
-// Everything else (Telegram API calls, OpenRouter streaming,
-// LangSearch web search, image handling, message chunking) is
-// unchanged, since it's all plain `fetch()` calls that work the
-// same in Node 18+ as they did in Workers.
+// Webhook security:
+//   1. Secret/random URL path: /webhook/<WEBHOOK_PATH_TOKEN>
+//   2. Telegram secret header:
+//      X-Telegram-Bot-Api-Secret-Token
+//
 // ============================================================
 
-
 // ============================================================
-// REQUIRED ENV VARS (set these in Render's dashboard)
+// REQUIRED ENV VARS
 // ============================================================
 //
 // BOT_TOKEN
 // OPENROUTER_API_KEY
+// WEBHOOK_SECRET
+// WEBHOOK_PATH_TOKEN
 //
 // ============================================================
 // OPTIONAL ENV VARS
@@ -46,9 +30,8 @@
 // OPENROUTER_HTTP_REFERER
 // OPENROUTER_X_TITLE
 // LANGSEARCH_API_KEY
-// PORT (Render sets this automatically)
-// WEBHOOK_SECRET     <- strongly recommended, see README
-// GUEST_API_SECRET   <- required only if you use the /guest endpoint
+// GUEST_API_SECRET
+// PORT
 //
 // ============================================================
 
@@ -60,9 +43,11 @@ import express from "express";
 
 const TELEGRAM_API = "https://api.telegram.org";
 
-const OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_API =
+  "https://openrouter.ai/api/v1/chat/completions";
 
-const DEFAULT_MODEL = "minimax/minimax-m2.7:free";
+const DEFAULT_MODEL =
+  "minimax/minimax-m2.7:free";
 
 // Telegram platform limits.
 const TELEGRAM_TEXT_LIMIT = 4096;
@@ -100,14 +85,16 @@ const UPDATE_DEDUP_TTL_SECONDS = 300;
 // Web search (LangSearch) config
 // ------------------------------------------------------------
 
-const LANGSEARCH_SEARCH_API = "https://api.langsearch.com/v1/web-search";
+const LANGSEARCH_SEARCH_API =
+  "https://api.langsearch.com/v1/web-search";
 
 // Maximum number of actual LangSearch searches allowed per user
 // request.
 const MAX_WEB_SEARCHES = 3;
 
 // Hard safety cap for model round-trips.
-const MAX_TOOL_LOOP_ITERATIONS = MAX_WEB_SEARCHES + 3;
+const MAX_TOOL_LOOP_ITERATIONS =
+  MAX_WEB_SEARCHES + 3;
 
 const MAX_SEARCH_RESULTS = 5;
 
@@ -128,14 +115,14 @@ const WEB_SEARCH_TOOLS = [
           query: {
             type: "string",
             description:
-              "A concise, optimized web search query designed to find the most relevant and reliable information."
-          }
+              "A concise, optimized web search query designed to find the most relevant and reliable information.",
+          },
         },
         required: ["query"],
-        additionalProperties: false
-      }
-    }
-  }
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 const TOOL_SYSTEM_INSTRUCTIONS =
@@ -150,23 +137,14 @@ const TOOL_SYSTEM_INSTRUCTIONS =
   "- Do not invent sources, URLs, facts, or citations.\n" +
   "- If search results are insufficient or conflicting, explicitly acknowledge the uncertainty.";
 
-
 // ============================================================
 // GLOBAL CACHE
 // ============================================================
 
 let cachedBotUserId = null;
 
-
 // ============================================================
-// IN-MEMORY KV STORE (replaces Cloudflare KV)
-// ============================================================
-//
-// Same .get()/.put() interface as Cloudflare KV so the rest of
-// the bot's code (history, dedup) doesn't need to change.
-// NOTE: this resets on every restart/redeploy. If you need
-// history to survive restarts, back this with Redis instead
-// (see README.md).
+// IN-MEMORY KV STORE
 // ============================================================
 
 class SimpleKV {
@@ -181,7 +159,10 @@ class SimpleKV {
       return null;
     }
 
-    if (entry.expiresAt && Date.now() > entry.expiresAt) {
+    if (
+      entry.expiresAt &&
+      Date.now() > entry.expiresAt
+    ) {
       this.store.delete(key);
       return null;
     }
@@ -189,190 +170,462 @@ class SimpleKV {
     return entry.value;
   }
 
-  async put(key, value, options = {}) {
+  async put(
+    key,
+    value,
+    options = {}
+  ) {
     const expiresAt =
-      options && options.expirationTtl
-        ? Date.now() + options.expirationTtl * 1000
+      options &&
+      options.expirationTtl
+        ? Date.now() +
+          options.expirationTtl * 1000
         : null;
 
-    this.store.set(key, { value, expiresAt });
+    this.store.set(
+      key,
+      {
+        value,
+        expiresAt,
+      }
+    );
   }
 
-  // Basic periodic cleanup so the Map doesn't grow forever.
   sweep() {
     const now = Date.now();
 
-    for (const [key, entry] of this.store.entries()) {
-      if (entry.expiresAt && now > entry.expiresAt) {
+    for (
+      const [key, entry] of
+      this.store.entries()
+    ) {
+      if (
+        entry.expiresAt &&
+        now > entry.expiresAt
+      ) {
         this.store.delete(key);
       }
     }
   }
 }
 
-const chatHistoryStore = new SimpleKV();
+const chatHistoryStore =
+  new SimpleKV();
 
-// Sweep expired keys every 5 minutes.
-setInterval(() => chatHistoryStore.sweep(), 5 * 60 * 1000);
+setInterval(
+  () =>
+    chatHistoryStore.sweep(),
+  5 * 60 * 1000
+);
 
 // ============================================================
-// ENV (maps process.env -> the shape the rest of the code expects)
+// ENV
 // ============================================================
 
 const env = {
-  BOT_TOKEN: process.env.BOT_TOKEN,
-  OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
-  BOT_USERNAME: process.env.BOT_USERNAME,
-  TRIGGER_COMMAND: process.env.TRIGGER_COMMAND,
-  SYSTEM_PROMPT: process.env.SYSTEM_PROMPT,
-  OPENROUTER_MODEL: process.env.OPENROUTER_MODEL,
-  OPENROUTER_HTTP_REFERER: process.env.OPENROUTER_HTTP_REFERER,
-  OPENROUTER_X_TITLE: process.env.OPENROUTER_X_TITLE,
-  LANGSEARCH_API_KEY: process.env.LANGSEARCH_API_KEY,
-  WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,
-  GUEST_API_SECRET: process.env.GUEST_API_SECRET,
-  CHAT_HISTORY: chatHistoryStore
+  BOT_TOKEN:
+    process.env.BOT_TOKEN,
+
+  OPENROUTER_API_KEY:
+    process.env.OPENROUTER_API_KEY,
+
+  BOT_USERNAME:
+    process.env.BOT_USERNAME,
+
+  TRIGGER_COMMAND:
+    process.env.TRIGGER_COMMAND,
+
+  SYSTEM_PROMPT:
+    process.env.SYSTEM_PROMPT,
+
+  OPENROUTER_MODEL:
+    process.env.OPENROUTER_MODEL,
+
+  OPENROUTER_HTTP_REFERER:
+    process.env.OPENROUTER_HTTP_REFERER,
+
+  OPENROUTER_X_TITLE:
+    process.env.OPENROUTER_X_TITLE,
+
+  LANGSEARCH_API_KEY:
+    process.env.LANGSEARCH_API_KEY,
+
+  WEBHOOK_SECRET:
+    process.env.WEBHOOK_SECRET,
+
+  WEBHOOK_PATH_TOKEN:
+    process.env.WEBHOOK_PATH_TOKEN,
+
+  GUEST_API_SECRET:
+    process.env.GUEST_API_SECRET,
+
+  CHAT_HISTORY:
+    chatHistoryStore,
 };
 
+// ============================================================
+// WEBHOOK PATH
+// ============================================================
+//
+// IMPORTANT:
+// Keep WEBHOOK_PATH_TOKEN stable.
+// Do NOT generate it using Math.random() on each restart,
+// otherwise Telegram's saved webhook URL would stop matching.
+//
+// Example:
+//
+// WEBHOOK_PATH_TOKEN=7d9a31f84b62c0e51a8f93d72c46e105c8b71f4
+//
+// Final URL:
+//
+// /webhook/7d9a31f84b62c0e51a8f93d72c46e105c8b71f4
+//
+// ============================================================
+
+const WEBHOOK_PATH_TOKEN =
+  env.WEBHOOK_PATH_TOKEN ||
+  "change-this-webhook-path-token";
+
+const WEBHOOK_PATH =
+  `/webhook/${WEBHOOK_PATH_TOKEN}`;
+
+// ============================================================
+// ENV VALIDATION
+// ============================================================
+
 if (!env.BOT_TOKEN) {
-  console.error("Missing required env var: BOT_TOKEN");
-}
-
-if (!env.OPENROUTER_API_KEY) {
-  console.error("Missing required env var: OPENROUTER_API_KEY");
-}
-
-if (!env.WEBHOOK_SECRET) {
-  console.warn(
-    "WEBHOOK_SECRET is not set. Anyone who finds your /webhook URL " +
-      "can POST fake Telegram updates to it. Set WEBHOOK_SECRET and " +
-      "pass the same value as secret_token when calling setWebhook. " +
-      "See README.md."
+  console.error(
+    "Missing required env var: BOT_TOKEN"
   );
 }
 
+if (!env.OPENROUTER_API_KEY) {
+  console.error(
+    "Missing required env var: OPENROUTER_API_KEY"
+  );
+}
+
+if (!env.WEBHOOK_SECRET) {
+  console.error(
+    "Missing required env var: WEBHOOK_SECRET. " +
+      "Webhook requests will be rejected."
+  );
+}
+
+if (!env.WEBHOOK_PATH_TOKEN) {
+  console.warn(
+    "WEBHOOK_PATH_TOKEN is not set. " +
+      "Using the fallback path token. " +
+      "Set WEBHOOK_PATH_TOKEN in the environment."
+  );
+}
 
 // ============================================================
-// EXPRESS SERVER (replaces the Workers fetch handler)
+// EXPRESS SERVER
 // ============================================================
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
 
-// Health check / browser hit.
-app.get("/", (req, res) => {
-  res.status(200).send("AI Bot Running");
-});
+app.use(
+  express.json({
+    limit: "1mb",
+  })
+);
 
-// Telegram webhook endpoint.
-app.post("/webhook", async (req, res) => {
-  // --------------------------------------------------------
-  // Verify this request actually came from Telegram.
-  //
-  // Without this, the webhook URL is a public, unauthenticated
-  // endpoint: anyone who guesses/finds it can POST a fake
-  // Update and make the bot burn OpenRouter/LangSearch credits
-  // or spam arbitrary chat IDs. Telegram sends the secret_token
-  // you configured in setWebhook back in this header on every
-  // real request.
-  // --------------------------------------------------------
+// ------------------------------------------------------------
+// Health check
+// ------------------------------------------------------------
 
-  if (env.WEBHOOK_SECRET) {
-    const providedSecret = req.get(
-      "X-Telegram-Bot-Api-Secret-Token"
-    );
+app.get(
+  "/",
+  (req, res) => {
+    res
+      .status(200)
+      .send("AI Bot Running");
+  }
+);
 
-    if (providedSecret !== env.WEBHOOK_SECRET) {
-      console.warn(
-        "Rejected /webhook request with missing/invalid secret token."
+// ============================================================
+// SECURE TELEGRAM WEBHOOK
+// ============================================================
+//
+// Telegram POSTs here.
+//
+// Security has TWO layers:
+//
+// 1. Secret/random URL path
+// 2. Telegram's secret header
+//
+// ============================================================
+
+app.post(
+  WEBHOOK_PATH,
+  async (req, res) => {
+    // --------------------------------------------------------
+    // Verify Telegram secret header.
+    //
+    // DO NOT log actual secret values.
+    // --------------------------------------------------------
+
+    const providedSecret =
+      req.get(
+        "X-Telegram-Bot-Api-Secret-Token"
       );
 
-      res.status(401).send("Unauthorized");
+    const expectedSecret =
+      env.WEBHOOK_SECRET;
+
+    // Safe diagnostics.
+    console.log(
+      "========== TELEGRAM WEBHOOK =========="
+    );
+
+    console.log(
+      "Webhook path:",
+      req.path
+    );
+
+    console.log(
+      "Secret configured:",
+      Boolean(
+        expectedSecret
+      )
+    );
+
+    console.log(
+      "Secret header received:",
+      Boolean(
+        providedSecret
+      )
+    );
+
+    console.log(
+      "Received secret length:",
+      providedSecret
+        ? providedSecret.length
+        : 0
+    );
+
+    console.log(
+      "Expected secret length:",
+      expectedSecret
+        ? expectedSecret.length
+        : 0
+    );
+
+    const secretMatches =
+      Boolean(
+        expectedSecret &&
+        providedSecret &&
+        providedSecret ===
+          expectedSecret
+      );
+
+    console.log(
+      "Secret matches:",
+      secretMatches
+    );
+
+    // --------------------------------------------------------
+    // Secret must exist.
+    // --------------------------------------------------------
+
+    if (!expectedSecret) {
+      console.error(
+        "WEBHOOK_SECRET is not configured. " +
+          "Rejecting webhook request."
+      );
+
+      res
+        .status(500)
+        .send(
+          "Webhook secret is not configured."
+        );
 
       return;
     }
-  }
 
-  const update = req.body;
+    // --------------------------------------------------------
+    // Secret must match.
+    // --------------------------------------------------------
 
-  // Acknowledge Telegram immediately so it doesn't retry/timeout.
-  res.status(200).send("OK");
+    if (!secretMatches) {
+      console.warn(
+        "Rejected /webhook request with " +
+          "missing/invalid secret token."
+      );
 
-  // --------------------------------------------------------
-  // Deduplication
-  // --------------------------------------------------------
+      res
+        .status(401)
+        .send(
+          "Unauthorized"
+        );
 
-  try {
-    if (update && update.update_id !== undefined) {
-      const key = `update:${update.update_id}`;
-      const seen = await env.CHAT_HISTORY.get(key);
-
-      if (seen) {
-        console.log("Duplicate update:", update.update_id);
-        return;
-      }
-
-      await env.CHAT_HISTORY.put(key, "1", {
-        expirationTtl: UPDATE_DEDUP_TTL_SECONDS
-      });
+      return;
     }
-  } catch (error) {
-    console.error("KV dedup error:", error);
+
+    console.log(
+      "Webhook authentication: SUCCESS"
+    );
+
+    // --------------------------------------------------------
+    // Telegram update
+    // --------------------------------------------------------
+
+    const update =
+      req.body;
+
+    // Acknowledge Telegram immediately.
+    res
+      .status(200)
+      .send("OK");
+
+    // --------------------------------------------------------
+    // Deduplication
+    // --------------------------------------------------------
+
+    try {
+      if (
+        update &&
+        update.update_id !==
+          undefined
+      ) {
+        const key =
+          `update:${update.update_id}`;
+
+        const seen =
+          await env.CHAT_HISTORY.get(
+            key
+          );
+
+        if (seen) {
+          console.log(
+            "Duplicate update:",
+            update.update_id
+          );
+
+          return;
+        }
+
+        await env.CHAT_HISTORY.put(
+          key,
+          "1",
+          {
+            expirationTtl:
+              UPDATE_DEDUP_TTL_SECONDS,
+          }
+        );
+      }
+    } catch (error) {
+      console.error(
+        "KV dedup error:",
+        error
+      );
+    }
+
+    // --------------------------------------------------------
+    // Process asynchronously
+    // --------------------------------------------------------
+
+    processUpdate(
+      update,
+      env
+    ).catch(
+      (error) => {
+        console.error(
+          "processUpdate fatal error:",
+          error
+        );
+      }
+    );
   }
+);
 
-  // --------------------------------------------------------
-  // Process asynchronously (fire-and-forget, replaces
-  // ctx.waitUntil / Cloudflare Queues).
-  // --------------------------------------------------------
+// ============================================================
+// OPTIONAL GUEST ENDPOINT
+// ============================================================
 
-  processUpdate(update, env).catch((error) => {
-    console.error("processUpdate fatal error:", error);
-  });
-});
+app.post(
+  "/guest",
+  async (req, res) => {
+    if (
+      !env.GUEST_API_SECRET
+    ) {
+      res
+        .status(404)
+        .send("Not found");
 
-// Optional: guest-mode endpoint, if you have a frontend that
-// posts { guest_message: {...} } directly instead of going
-// through Telegram.
-//
-// Disabled unless GUEST_API_SECRET is set, because this endpoint
-// triggers billed OpenRouter (and optionally LangSearch) calls
-// with no Telegram-side authentication of its own.
-app.post("/guest", async (req, res) => {
-  if (!env.GUEST_API_SECRET) {
-    res.status(404).send("Not found");
+      return;
+    }
 
-    return;
+    const providedSecret =
+      req.get(
+        "X-Guest-Secret"
+      );
+
+    if (
+      providedSecret !==
+      env.GUEST_API_SECRET
+    ) {
+      res
+        .status(401)
+        .send("Unauthorized");
+
+      return;
+    }
+
+    res
+      .status(200)
+      .send("OK");
+
+    processUpdate(
+      {
+        guest_message:
+          req.body,
+      },
+      env
+    ).catch(
+      (error) => {
+        console.error(
+          "guest processUpdate error:",
+          error
+        );
+      }
+    );
   }
+);
 
-  const providedSecret = req.get("X-Guest-Secret");
+// ============================================================
+// START SERVER
+// ============================================================
 
-  if (providedSecret !== env.GUEST_API_SECRET) {
-    res.status(401).send("Unauthorized");
+const PORT =
+  process.env.PORT ||
+  3000;
 
-    return;
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `Server listening on port ${PORT}`
+    );
+
+    console.log(
+      `Webhook path: ${WEBHOOK_PATH}`
+    );
   }
-
-  res.status(200).send("OK");
-
-  processUpdate({ guest_message: req.body }, env).catch((error) => {
-    console.error("guest processUpdate error:", error);
-  });
-});
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
-
+);
 
 // ============================================================
 // PROCESS UPDATE
 // ============================================================
 
-async function processUpdate(update, env) {
+async function processUpdate(
+  update,
+  env
+) {
   try {
-    const token = env.BOT_TOKEN;
+    const token =
+      env.BOT_TOKEN;
 
     if (!token) {
       console.error(
@@ -427,13 +680,15 @@ async function processUpdate(update, env) {
       return;
     }
 
-    const chat = message.chat;
+    const chat =
+      message.chat;
 
     if (!chat) {
       return;
     }
 
-    const chatId = chat.id;
+    const chatId =
+      chat.id;
 
     const userId =
       message.from &&
@@ -445,24 +700,32 @@ async function processUpdate(update, env) {
       message.message_id;
 
     const text =
-      message.text || "";
+      message.text ||
+      "";
 
     const caption =
-      message.caption || "";
+      message.caption ||
+      "";
 
     const photos =
-      Array.isArray(message.photo)
+      Array.isArray(
+        message.photo
+      )
         ? message.photo
         : null;
 
     const isPrivate =
-      chat.type === "private";
+      chat.type ===
+      "private";
 
     // ========================================================
     // /start
     // ========================================================
 
-    if (text.trim() === "/start") {
+    if (
+      text.trim() ===
+      "/start"
+    ) {
       await handleStart(
         token,
         chatId,
@@ -477,7 +740,10 @@ async function processUpdate(update, env) {
     // /help
     // ========================================================
 
-    if (text.trim() === "/help") {
+    if (
+      text.trim() ===
+      "/help"
+    ) {
       await sendMessage(
         token,
         chatId,
@@ -498,9 +764,9 @@ async function processUpdate(update, env) {
           "Model: `" +
             escapeMarkdown(
               env.OPENROUTER_MODEL ||
-              DEFAULT_MODEL
+                DEFAULT_MODEL
             ) +
-            "`"
+            "`",
         ].join("\n"),
         messageId
       );
@@ -512,10 +778,15 @@ async function processUpdate(update, env) {
     // GET BOT USER ID
     // ========================================================
 
-    if (cachedBotUserId === null) {
+    if (
+      cachedBotUserId ===
+      null
+    ) {
       try {
         cachedBotUserId =
-          await getBotUserId(token);
+          await getBotUserId(
+            token
+          );
       } catch (error) {
         console.error(
           "getMe failed:",
@@ -528,12 +799,14 @@ async function processUpdate(update, env) {
     // CHECK MESSAGE TARGET
     // ========================================================
 
-    let shouldReply = false;
+    let shouldReply =
+      false;
 
     let prompt =
       text || caption;
 
-    let isImage = false;
+    let isImage =
+      false;
 
     // ========================================================
     // PHOTO
@@ -546,7 +819,8 @@ async function processUpdate(update, env) {
       isImage = true;
 
       if (isPrivate) {
-        shouldReply = true;
+        shouldReply =
+          true;
       } else {
         shouldReply =
           isMentionedOrTriggered(
@@ -575,7 +849,8 @@ async function processUpdate(update, env) {
 
     else {
       if (isPrivate) {
-        shouldReply = true;
+        shouldReply =
+          true;
       } else {
         shouldReply =
           isMentionedOrTriggered(
@@ -633,7 +908,8 @@ async function processUpdate(update, env) {
     // IMAGE
     // ========================================================
 
-    let imageData = null;
+    let imageData =
+      null;
 
     if (
       isImage &&
@@ -641,7 +917,9 @@ async function processUpdate(update, env) {
     ) {
       try {
         const largest =
-          photos[photos.length - 1];
+          photos[
+            photos.length - 1
+          ];
 
         imageData =
           await downloadImage(
@@ -688,7 +966,6 @@ async function processUpdate(update, env) {
   }
 }
 
-
 // ============================================================
 // /START
 // ============================================================
@@ -723,7 +1000,7 @@ async function handleStart(
         `${env.TRIGGER_COMMAND || "!ai"} your question`,
         "or reply to one of my messages.",
         "",
-        "Creator: @Hose3in"
+        "Creator: @Hose3in",
       ].join("\n"),
       replyToMessageId
     );
@@ -735,7 +1012,6 @@ async function handleStart(
 
   return result;
 }
-
 
 // ============================================================
 // MAIN AI GENERATOR
@@ -760,28 +1036,31 @@ async function generateAI(
   // STREAM STATE
   // ----------------------------------------------------------
 
-  let fullAnswer = "";
+  let fullAnswer =
+    "";
 
-  let lastDisplayed = "";
+  let lastDisplayed =
+    "";
 
-  let lastDraftAt = 0;
+  let lastDraftAt =
+    0;
 
-  let lastEditChars = 0;
+  let lastEditChars =
+    0;
 
-  // Real Telegram messages used for
-  // group/private fallback streaming.
-  let streamMessageIds = [];
+  let streamMessageIds =
+    [];
 
-  // Stateful resilience for group streaming.
   const groupStreamState = {
     mode: "edit",
     editBackoffMs: 0,
     editBackoffUntil: 0,
     consecutiveEditFails: 0,
-    newModeSentLength: 0
+    newModeSentLength: 0,
   };
 
-  let usingRichDraft = false;
+  let usingRichDraft =
+    false;
 
   // ----------------------------------------------------------
   // Rich draft ID
@@ -794,17 +1073,25 @@ async function generateAI(
   // Typing indicator
   // ----------------------------------------------------------
 
-  let typingActive = true;
+  let typingActive =
+    true;
 
   const typingTimer =
-    setInterval(function () {
-      if (typingActive) {
-        sendTyping(
-          token,
-          chatId
-        ).catch(function () {});
-      }
-    }, 5000);
+    setInterval(
+      function () {
+        if (
+          typingActive
+        ) {
+          sendTyping(
+            token,
+            chatId
+          ).catch(
+            function () {}
+          );
+        }
+      },
+      5000
+    );
 
   // ----------------------------------------------------------
   // Reads one OpenRouter SSE stream.
@@ -813,11 +1100,14 @@ async function generateAI(
   async function readOpenRouterStream(
     response
   ) {
-    let sseBuffer = "";
+    let sseBuffer =
+      "";
 
-    const toolCallAccumulator = [];
+    const toolCallAccumulator =
+      [];
 
-    let finishReason = null;
+    let finishReason =
+      null;
 
     const reader =
       response.body.getReader();
@@ -846,7 +1136,9 @@ async function generateAI(
 
           try {
             await reader.cancel();
-          } catch (cancelError) {
+          } catch (
+            cancelError
+          ) {
             console.warn(
               "SSE reader cancel failed:",
               cancelError
@@ -864,33 +1156,41 @@ async function generateAI(
           decoder.decode(
             result.value,
             {
-              stream: true
+              stream: true,
             }
           );
 
         const lines =
-          sseBuffer.split("\n");
+          sseBuffer.split(
+            "\n"
+          );
 
         sseBuffer =
           lines.pop() || "";
 
         for (
-          const rawLine of lines
+          const rawLine of
+          lines
         ) {
           const line =
             rawLine.trim();
 
           if (
-            !line.startsWith("data:")
+            !line.startsWith(
+              "data:"
+            )
           ) {
             continue;
           }
 
           const payload =
-            line.slice(5).trim();
+            line
+              .slice(5)
+              .trim();
 
           if (
-            payload === "[DONE]"
+            payload ===
+            "[DONE]"
           ) {
             continue;
           }
@@ -899,7 +1199,9 @@ async function generateAI(
 
           try {
             chunk =
-              JSON.parse(payload);
+              JSON.parse(
+                payload
+              );
           } catch {
             continue;
           }
@@ -925,9 +1227,9 @@ async function generateAI(
             continue;
           }
 
-          // ----------------------------------------------------
+          // --------------------------------------------------
           // Tool calls
-          // ----------------------------------------------------
+          // --------------------------------------------------
 
           if (
             Array.isArray(
@@ -940,9 +1242,9 @@ async function generateAI(
             );
           }
 
-          // ----------------------------------------------------
+          // --------------------------------------------------
           // Reasoning
-          // ----------------------------------------------------
+          // --------------------------------------------------
 
           const hasReasoning =
             Boolean(
@@ -959,10 +1261,12 @@ async function generateAI(
               Date.now();
 
             if (
-              now - lastDraftAt >=
+              now -
+                lastDraftAt >=
               STREAM_EDIT_INTERVAL_MS
             ) {
-              lastDraftAt = now;
+              lastDraftAt =
+                now;
 
               await sendRichMessageDraft(
                 token,
@@ -973,12 +1277,14 @@ async function generateAI(
             }
           }
 
-          // ----------------------------------------------------
+          // --------------------------------------------------
           // Content
-          // ----------------------------------------------------
+          // --------------------------------------------------
 
           const content =
-            extractContent(delta);
+            extractContent(
+              delta
+            );
 
           if (!content) {
             continue;
@@ -987,9 +1293,9 @@ async function generateAI(
           fullAnswer +=
             content;
 
-          // ----------------------------------------------------
+          // --------------------------------------------------
           // STREAM THROTTLE
-          // ----------------------------------------------------
+          // --------------------------------------------------
 
           const now =
             Date.now();
@@ -999,7 +1305,8 @@ async function generateAI(
             lastEditChars;
 
           if (
-            now - lastDraftAt <
+            now -
+              lastDraftAt <
               MIN_STREAM_EDIT_INTERVAL_MS ||
             newChars <
               MIN_STREAM_NEW_CHARS
@@ -1007,14 +1314,15 @@ async function generateAI(
             continue;
           }
 
-          lastDraftAt = now;
+          lastDraftAt =
+            now;
 
           lastEditChars =
             fullAnswer.length;
 
-          // ====================================================
+          // ==================================================
           // PRIVATE — RICH DRAFT
-          // ====================================================
+          // ==================================================
 
           if (usingRichDraft) {
             const liveText =
@@ -1049,9 +1357,9 @@ async function generateAI(
             continue;
           }
 
-          // ====================================================
+          // ==================================================
           // GROUP — STREAM
-          // ====================================================
+          // ==================================================
 
           if (
             streamMessageIds.length >
@@ -1087,7 +1395,7 @@ async function generateAI(
         toolCallAccumulator.filter(
           Boolean
         ),
-      finishReason
+      finishReason,
     };
   }
 
@@ -1142,7 +1450,8 @@ async function generateAI(
       if (
         richDraftResult.ok
       ) {
-        usingRichDraft = true;
+        usingRichDraft =
+          true;
 
         console.log(
           "Rich draft streaming enabled."
@@ -1220,23 +1529,29 @@ async function generateAI(
     // OPENROUTER + TOOL CALLING LOOP
     // ========================================================
 
-    let searchRoundsUsed = 0;
+    let searchRoundsUsed =
+      0;
 
-    let finalAnswer = "";
+    let finalAnswer =
+      "";
 
     for (
       let iteration = 0;
       iteration <
-        MAX_TOOL_LOOP_ITERATIONS;
+      MAX_TOOL_LOOP_ITERATIONS;
       iteration++
     ) {
-      fullAnswer = "";
+      fullAnswer =
+        "";
 
-      lastDisplayed = "";
+      lastDisplayed =
+        "";
 
-      lastDraftAt = 0;
+      lastDraftAt =
+        0;
 
-      lastEditChars = 0;
+      lastEditChars =
+        0;
 
       const toolsForThisRound =
         searchRoundsUsed <
@@ -1260,7 +1575,7 @@ async function generateAI(
             Boolean(
               toolsForThisRound
             ),
-          searchRoundsUsed
+          searchRoundsUsed,
         }
       );
 
@@ -1296,9 +1611,11 @@ async function generateAI(
         requestedToolCalls.length >
           0
       ) {
-        const assistantToolCalls = [];
+        const assistantToolCalls =
+          [];
 
-        const toolResultMessages = [];
+        const toolResultMessages =
+          [];
 
         for (
           const call of
@@ -1322,8 +1639,8 @@ async function generateAI(
               arguments:
                 call.function
                   .arguments ||
-                "{}"
-            }
+                "{}",
+            },
           });
 
           let toolResultText;
@@ -1390,7 +1707,7 @@ async function generateAI(
             tool_call_id:
               call.id,
             content:
-              toolResultText
+              toolResultText,
           });
         }
 
@@ -1416,8 +1733,8 @@ async function generateAI(
                 content:
                   fullAnswer,
                 tool_calls:
-                  assistantToolCalls
-              }
+                  assistantToolCalls,
+              },
             ],
             toolResultMessages
           );
@@ -1564,14 +1881,14 @@ async function generateAI(
       }
     }
   } finally {
-    typingActive = false;
+    typingActive =
+      false;
 
     clearInterval(
       typingTimer
     );
   }
 }
-
 
 // ============================================================
 // GROUP STREAM SYNC
@@ -1591,7 +1908,7 @@ async function syncGroupStream(
       editBackoffMs: 0,
       editBackoffUntil: 0,
       consecutiveEditFails: 0,
-      newModeSentLength: 0
+      newModeSentLength: 0,
     };
 
   const parts =
@@ -1632,7 +1949,7 @@ async function syncGroupStream(
 
   if (
     text.length >=
-      SWITCH_TO_NEW_MESSAGES_AT
+    SWITCH_TO_NEW_MESSAGES_AT
   ) {
     await switchGroupStreamToNewMessages(
       token,
@@ -1656,14 +1973,14 @@ async function syncGroupStream(
     return;
   }
 
-  // Only current page needs updating.
   const lastIndex =
     parts.length - 1;
 
   // Ensure current page exists.
   if (
-    streamMessageIds[lastIndex] ===
-    undefined
+    streamMessageIds[
+      lastIndex
+    ] === undefined
   ) {
     const part =
       parts[lastIndex];
@@ -1683,16 +2000,23 @@ async function syncGroupStream(
         sent.result.message_id
       );
 
-      streamState.editBackoffMs = 0;
-      streamState.editBackoffUntil = 0;
-      streamState.consecutiveEditFails = 0;
+      streamState.editBackoffMs =
+        0;
+
+      streamState.editBackoffUntil =
+        0;
+
+      streamState.consecutiveEditFails =
+        0;
     }
 
     return;
   }
 
   const messageId =
-    streamMessageIds[lastIndex];
+    streamMessageIds[
+      lastIndex
+    ];
 
   const part =
     parts[lastIndex];
@@ -1707,16 +2031,17 @@ async function syncGroupStream(
     );
 
   if (edited.ok) {
-    streamState.consecutiveEditFails = 0;
-    streamState.editBackoffMs = 0;
-    streamState.editBackoffUntil = 0;
+    streamState.consecutiveEditFails =
+      0;
+
+    streamState.editBackoffMs =
+      0;
+
+    streamState.editBackoffUntil =
+      0;
 
     return;
   }
-
-  // ----------------------------------------------------------
-  // Rate-limit handling
-  // ----------------------------------------------------------
 
   const retryAfter =
     getTelegramRetryAfter(
@@ -1751,7 +2076,8 @@ async function syncGroupStream(
       );
 
     streamState.editBackoffUntil =
-      Date.now() + waitMs;
+      Date.now() +
+      waitMs;
 
     console.warn(
       `Group edit rate-limited (${streamState.consecutiveEditFails}); backoff ${waitMs}ms`
@@ -1789,9 +2115,14 @@ async function syncGroupStream(
   if (
     markdownEdited.ok
   ) {
-    streamState.consecutiveEditFails = 0;
-    streamState.editBackoffMs = 0;
-    streamState.editBackoffUntil = 0;
+    streamState.consecutiveEditFails =
+      0;
+
+    streamState.editBackoffMs =
+      0;
+
+    streamState.editBackoffUntil =
+      0;
 
     return;
   }
@@ -1818,7 +2149,6 @@ async function syncGroupStream(
   }
 }
 
-
 // ============================================================
 // SWITCH TO NEW MESSAGE MODE
 // ============================================================
@@ -1830,7 +2160,6 @@ async function switchGroupStreamToNewMessages(
   fullText,
   state
 ) {
-  // Delete current stream messages.
   for (
     const messageId of
     streamMessageIds.splice(0)
@@ -1857,7 +2186,7 @@ async function switchGroupStreamToNewMessages(
   state.newModeSentLength =
     0;
 
-  return await appendNewModeStream(
+  return appendNewModeStream(
     token,
     chatId,
     fullText,
@@ -1866,7 +2195,6 @@ async function switchGroupStreamToNewMessages(
     streamMessageIds
   );
 }
-
 
 // ============================================================
 // NEW MESSAGE STREAM MODE
@@ -1885,7 +2213,8 @@ async function appendNewModeStream(
     String(fullText || "");
 
   const previousLength =
-    state.newModeSentLength || 0;
+    state.newModeSentLength ||
+    0;
 
   const tail =
     text.slice(
@@ -1943,7 +2272,9 @@ async function appendNewModeStream(
 
     if (
       result.result &&
-      Array.isArray(streamMessageIds)
+      Array.isArray(
+        streamMessageIds
+      )
     ) {
       streamMessageIds.push(
         result.result.message_id
@@ -1958,7 +2289,6 @@ async function appendNewModeStream(
 
   return true;
 }
-
 
 // ============================================================
 // FINALIZE GROUP MESSAGES
@@ -2055,11 +2385,6 @@ async function finalizeGroupMessages(
           plainEdit.description
         );
 
-        // Important:
-        // The answer must not disappear merely because
-        // an old streaming message can no longer be edited.
-        //
-        // Send a fresh chunk so the user still receives it.
         const replacement =
           await sendPlainMessage(
             token,
@@ -2135,7 +2460,7 @@ async function finalizeGroupMessages(
   }
 
   // ----------------------------------------------------------
-  // Delete any stale extra stream pages
+  // Delete stale extra stream pages
   // ----------------------------------------------------------
 
   if (
@@ -2159,7 +2484,6 @@ async function finalizeGroupMessages(
   }
 }
 
-
 // ============================================================
 // FINAL RICH RESPONSE
 // ============================================================
@@ -2176,10 +2500,12 @@ async function sendFinalRichResponse(
       RICH_TEXT_LIMIT
     );
 
-  let first = true;
+  let first =
+    true;
 
   for (
-    const part of parts
+    const part of
+    parts
   ) {
     const result =
       await sendRichMessage(
@@ -2194,9 +2520,6 @@ async function sendFinalRichResponse(
     if (
       !result.ok
     ) {
-      // Rich failed.
-      // DO NOT send the entire rich part as plain text if it
-      // exceeds Telegram's normal 4096-char limit.
       await sendChunked(
         token,
         chatId,
@@ -2209,10 +2532,10 @@ async function sendFinalRichResponse(
       );
     }
 
-    first = false;
+    first =
+      false;
   }
 }
-
 
 // ============================================================
 // SEND RICH MESSAGE
@@ -2225,29 +2548,33 @@ async function sendRichMessage(
   replyToMessageId
 ) {
   const body = {
-    chat_id: chatId,
+    chat_id:
+      chatId,
+
     rich_message: {
-      markdown: markdownText
-    }
+      markdown:
+        markdownText,
+    },
   };
 
   if (
-    replyToMessageId !== undefined &&
-    replyToMessageId !== null
+    replyToMessageId !==
+      undefined &&
+    replyToMessageId !==
+      null
   ) {
     body.reply_parameters = {
       message_id:
-        replyToMessageId
+        replyToMessageId,
     };
   }
 
-  return await telegramPost(
+  return telegramPost(
     token,
     "sendRichMessage",
     body
   );
 }
-
 
 // ============================================================
 // SEND RICH MESSAGE DRAFT
@@ -2261,27 +2588,32 @@ async function sendRichMessageDraft(
   messageThreadId
 ) {
   const body = {
-    chat_id: chatId,
-    draft_id: draftId,
+    chat_id:
+      chatId,
+
+    draft_id:
+      draftId,
+
     rich_message: {
-      markdown: markdownText
-    }
+      markdown:
+        markdownText,
+    },
   };
 
   if (
-    messageThreadId !== undefined
+    messageThreadId !==
+    undefined
   ) {
     body.message_thread_id =
       messageThreadId;
   }
 
-  return await telegramPost(
+  return telegramPost(
     token,
     "sendRichMessageDraft",
     body
   );
 }
-
 
 // ============================================================
 // EDIT RICH MESSAGE
@@ -2293,19 +2625,23 @@ async function editRichMessage(
   messageId,
   markdownText
 ) {
-  return await telegramPost(
+  return telegramPost(
     token,
     "editMessageText",
     {
-      chat_id: chatId,
-      message_id: messageId,
+      chat_id:
+        chatId,
+
+      message_id:
+        messageId,
+
       rich_message: {
-        markdown: markdownText
-      }
+        markdown:
+          markdownText,
+      },
     }
   );
 }
-
 
 // ============================================================
 // SEND MARKDOWN MESSAGE
@@ -2318,14 +2654,21 @@ async function sendMessage(
   replyToMessageId
 ) {
   const body = {
-    chat_id: chatId,
-    text: text,
-    parse_mode: "Markdown"
+    chat_id:
+      chatId,
+
+    text:
+      text,
+
+    parse_mode:
+      "Markdown",
   };
 
   if (
-    replyToMessageId !== undefined &&
-    replyToMessageId !== null
+    replyToMessageId !==
+      undefined &&
+    replyToMessageId !==
+      null
   ) {
     body.reply_to_message_id =
       replyToMessageId;
@@ -2341,7 +2684,7 @@ async function sendMessage(
   if (
     !result.ok
   ) {
-    return await sendPlainMessage(
+    return sendPlainMessage(
       token,
       chatId,
       text,
@@ -2351,7 +2694,6 @@ async function sendMessage(
 
   return result;
 }
-
 
 // ============================================================
 // PLAIN MESSAGE
@@ -2364,25 +2706,29 @@ async function sendPlainMessage(
   replyToMessageId
 ) {
   const body = {
-    chat_id: chatId,
-    text: text
+    chat_id:
+      chatId,
+
+    text:
+      text,
   };
 
   if (
-    replyToMessageId !== undefined &&
-    replyToMessageId !== null
+    replyToMessageId !==
+      undefined &&
+    replyToMessageId !==
+      null
   ) {
     body.reply_to_message_id =
       replyToMessageId;
   }
 
-  return await telegramPost(
+  return telegramPost(
     token,
     "sendMessage",
     body
   );
 }
-
 
 // ============================================================
 // EDIT MARKDOWN
@@ -2395,20 +2741,26 @@ async function editMarkdownMessage(
   text,
   skipRateLimitRetry = false
 ) {
-  return await telegramPost(
+  return telegramPost(
     token,
     "editMessageText",
     {
-      chat_id: chatId,
-      message_id: messageId,
-      text: text,
-      parse_mode: "Markdown"
+      chat_id:
+        chatId,
+
+      message_id:
+        messageId,
+
+      text:
+        text,
+
+      parse_mode:
+        "Markdown",
     },
     false,
     skipRateLimitRetry
   );
 }
-
 
 // ============================================================
 // EDIT PLAIN MESSAGE
@@ -2421,19 +2773,23 @@ async function editPlainMessage(
   text,
   skipRateLimitRetry = false
 ) {
-  return await telegramPost(
+  return telegramPost(
     token,
     "editMessageText",
     {
-      chat_id: chatId,
-      message_id: messageId,
-      text: text
+      chat_id:
+        chatId,
+
+      message_id:
+        messageId,
+
+      text:
+        text,
     },
     false,
     skipRateLimitRetry
   );
 }
-
 
 // ============================================================
 // CHUNKED MESSAGE DELIVERY
@@ -2447,8 +2803,6 @@ async function sendNewMessage(
   toRichHtml,
   replyToMessageId
 ) {
-  // The bot uses Telegram Rich Message markdown directly.
-  // Keep this function compatible with the generic chunking flow.
   if (useRich) {
     const result =
       await sendRichMessage(
@@ -2465,7 +2819,7 @@ async function sendNewMessage(
       return result;
     }
 
-    return await sendPlainMessage(
+    return sendPlainMessage(
       token,
       chatId,
       text,
@@ -2473,14 +2827,13 @@ async function sendNewMessage(
     );
   }
 
-  return await sendPlainMessage(
+  return sendPlainMessage(
     token,
     chatId,
     text,
     replyToMessageId
   );
 }
-
 
 async function appendChunk(
   token,
@@ -2492,7 +2845,9 @@ async function appendChunk(
   replyToMessageId
 ) {
   const tail =
-    String(fullText || "").slice(
+    String(
+      fullText || ""
+    ).slice(
       lastSentLength
     );
 
@@ -2545,7 +2900,6 @@ async function appendChunk(
 
   return fullText.length;
 }
-
 
 async function sendChunked(
   token,
@@ -2606,7 +2960,6 @@ async function sendChunked(
   }
 }
 
-
 // ============================================================
 // SAFE DELETE
 // ============================================================
@@ -2625,8 +2978,11 @@ async function safeDeleteMessage(
       token,
       "deleteMessage",
       {
-        chat_id: chatId,
-        message_id: messageId
+        chat_id:
+          chatId,
+
+        message_id:
+          messageId,
       }
     );
   } catch (error) {
@@ -2637,12 +2993,12 @@ async function safeDeleteMessage(
   }
 }
 
-
 // ============================================================
 // TELEGRAM API
 // ============================================================
 
-const MAX_FLOOD_WAIT_RETRY_SECONDS = 10;
+const MAX_FLOOD_WAIT_RETRY_SECONDS =
+  10;
 
 async function telegramPost(
   token,
@@ -2656,13 +3012,18 @@ async function telegramPost(
       await fetch(
         `${TELEGRAM_API}/bot${token}/${method}`,
         {
-          method: "POST",
+          method:
+            "POST",
+
           headers: {
             "Content-Type":
-              "application/json"
+              "application/json",
           },
+
           body:
-            JSON.stringify(body)
+            JSON.stringify(
+              body
+            ),
         }
       );
 
@@ -2678,9 +3039,11 @@ async function telegramPost(
         );
     } catch {
       data = {
-        ok: false,
+        ok:
+          false,
+
         description:
-          responseText
+          responseText,
       };
     }
 
@@ -2691,7 +3054,8 @@ async function telegramPost(
       );
 
       const retryAfter =
-        response.status === 429 &&
+        response.status ===
+          429 &&
         data &&
         data.parameters &&
         typeof data.parameters
@@ -2702,7 +3066,8 @@ async function telegramPost(
           : null;
 
       if (
-        retryAfter !== null &&
+        retryAfter !==
+          null &&
         !isRetry &&
         !skipRateLimitRetry
       ) {
@@ -2720,7 +3085,7 @@ async function telegramPost(
           waitSeconds * 1000
         );
 
-        return await telegramPost(
+        return telegramPost(
           token,
           method,
           body,
@@ -2738,13 +3103,14 @@ async function telegramPost(
     );
 
     return {
-      ok: false,
+      ok:
+        false,
+
       description:
-        String(error)
+        String(error),
     };
   }
 }
-
 
 // ============================================================
 // TELEGRAM RETRY-AFTER HELPER
@@ -2760,12 +3126,15 @@ function getTelegramRetryAfter(
     const value =
       result &&
       result.parameters &&
-      result.parameters.retry_after;
+      result.parameters
+        .retry_after;
 
     if (
       typeof value ===
-      "number" &&
-      Number.isFinite(value)
+        "number" &&
+      Number.isFinite(
+        value
+      )
     ) {
       return value;
     }
@@ -2774,12 +3143,15 @@ function getTelegramRetryAfter(
       result &&
       result.data &&
       result.data.parameters &&
-      result.data.parameters.retry_after;
+      result.data.parameters
+        .retry_after;
 
     if (
       typeof nested ===
-      "number" &&
-      Number.isFinite(nested)
+        "number" &&
+      Number.isFinite(
+        nested
+      )
     ) {
       return nested;
     }
@@ -2787,7 +3159,6 @@ function getTelegramRetryAfter(
 
   return null;
 }
-
 
 // ============================================================
 // TYPING
@@ -2797,16 +3168,18 @@ async function sendTyping(
   token,
   chatId
 ) {
-  return await telegramPost(
+  return telegramPost(
     token,
     "sendChatAction",
     {
-      chat_id: chatId,
-      action: "typing"
+      chat_id:
+        chatId,
+
+      action:
+        "typing",
     }
   );
 }
-
 
 // ============================================================
 // BOT ID
@@ -2835,7 +3208,6 @@ async function getBotUserId(
   return result.result.id;
 }
 
-
 // ============================================================
 // IMAGE
 // ============================================================
@@ -2849,7 +3221,8 @@ async function downloadImage(
       token,
       "getFile",
       {
-        file_id: fileId
+        file_id:
+          fileId,
       }
     );
 
@@ -2895,10 +3268,10 @@ async function downloadImage(
       arrayBufferToBase64(
         buffer
       ),
-    mimeType
+
+    mimeType,
   };
 }
-
 
 // ============================================================
 // MIME
@@ -2932,7 +3305,6 @@ function detectImageMimeType(
   return "image/jpeg";
 }
 
-
 // ============================================================
 // BUILD OPENROUTER MESSAGES
 // ============================================================
@@ -2944,7 +3316,8 @@ async function buildMessages(
   systemPrompt,
   imageData
 ) {
-  const messages = [];
+  const messages =
+    [];
 
   // ----------------------------------------------------------
   // System
@@ -2952,10 +3325,12 @@ async function buildMessages(
 
   if (systemPrompt) {
     messages.push({
-      role: "system",
+      role:
+        "system",
+
       content:
         systemPrompt +
-        TOOL_SYSTEM_INSTRUCTIONS
+        TOOL_SYSTEM_INSTRUCTIONS,
     });
   }
 
@@ -2965,20 +3340,28 @@ async function buildMessages(
 
   if (imageData) {
     messages.push({
-      role: "user",
+      role:
+        "user",
+
       content: [
         {
-          type: "text",
-          text: prompt
+          type:
+            "text",
+
+          text:
+            prompt,
         },
+
         {
-          type: "image_url",
+          type:
+            "image_url",
+
           image_url: {
             url:
-              `data:${imageData.mimeType};base64,${imageData.base64}`
-          }
-        }
-      ]
+              `data:${imageData.mimeType};base64,${imageData.base64}`,
+          },
+        },
+      ],
     });
 
     return messages;
@@ -3000,13 +3383,16 @@ async function buildMessages(
     );
 
   for (
-    const message of recent
+    const message of
+    recent
   ) {
     if (
       message &&
       (
-        message.role === "user" ||
-        message.role === "assistant"
+        message.role ===
+          "user" ||
+        message.role ===
+          "assistant"
       )
     ) {
       messages.push(
@@ -3020,13 +3406,15 @@ async function buildMessages(
   // ----------------------------------------------------------
 
   messages.push({
-    role: "user",
-    content: prompt
+    role:
+      "user",
+
+    content:
+      prompt,
   });
 
   return messages;
 }
-
 
 // ============================================================
 // OPENROUTER
@@ -3052,16 +3440,22 @@ async function createOpenRouterRequest(
     DEFAULT_MODEL;
 
   const body = {
-    model: model,
-    messages: messages,
-    stream: stream
+    model:
+      model,
+
+    messages:
+      messages,
+
+    stream:
+      stream,
   };
 
   if (
     tools &&
     tools.length > 0
   ) {
-    body.tools = tools;
+    body.tools =
+      tools;
 
     body.tool_choice =
       "auto";
@@ -3070,50 +3464,65 @@ async function createOpenRouterRequest(
   const headers = {
     Authorization:
       `Bearer ${apiKey}`,
+
     "Content-Type":
-      "application/json"
+      "application/json",
   };
 
   if (
     env.OPENROUTER_HTTP_REFERER
   ) {
-    headers["HTTP-Referer"] =
+    headers[
+      "HTTP-Referer"
+    ] =
       env.OPENROUTER_HTTP_REFERER;
   }
 
   if (
     env.OPENROUTER_X_TITLE
   ) {
-    headers["X-Title"] =
+    headers[
+      "X-Title"
+    ] =
       env.OPENROUTER_X_TITLE;
   }
 
   console.log(
     "OpenRouter request:",
     {
-      model: model,
-      stream: stream,
-      tools: Boolean(
-        tools &&
-        tools.length
-      )
+      model:
+        model,
+
+      stream:
+        stream,
+
+      tools:
+        Boolean(
+          tools &&
+          tools.length
+        ),
     }
   );
 
-  return await fetch(
+  return fetch(
     OPENROUTER_API,
     {
-      method: "POST",
-      headers: headers,
+      method:
+        "POST",
+
+      headers:
+        headers,
+
       body:
-        JSON.stringify(body)
+        JSON.stringify(
+          body
+        ),
     }
   );
 }
 
-
 // ============================================================
-// WEB SEARCH (LANGSEARCH)
+// WEB SEARCH
 // ============================================================
 
 async function searchWeb(
@@ -3132,22 +3541,30 @@ async function searchWeb(
     await fetch(
       LANGSEARCH_SEARCH_API,
       {
-        method: "POST",
+        method:
+          "POST",
+
         headers: {
           "Content-Type":
             "application/json",
+
           Authorization:
-            `Bearer ${env.LANGSEARCH_API_KEY}`
+            `Bearer ${env.LANGSEARCH_API_KEY}`,
         },
+
         body:
           JSON.stringify({
             query,
+
             freshness:
               "noLimit",
-            summary: true,
+
+            summary:
+              true,
+
             count:
-              MAX_SEARCH_RESULTS
-          })
+              MAX_SEARCH_RESULTS,
+          }),
       }
     );
 
@@ -3185,7 +3602,6 @@ async function searchWeb(
 
   return data;
 }
-
 
 // ============================================================
 // SEARCH RESULT NORMALIZATION
@@ -3225,8 +3641,10 @@ function normalizeSearchResults(
           ),
 
         url:
-          (result &&
-            result.url) ||
+          (
+            result &&
+            result.url
+          ) ||
           "",
 
         content:
@@ -3240,11 +3658,10 @@ function normalizeSearchResults(
             ) ||
               "",
             MAX_RESULT_CONTENT_LENGTH
-          )
+          ),
       })
     );
 }
-
 
 // ============================================================
 // FORMAT SEARCH RESULTS
@@ -3256,7 +3673,8 @@ function formatSearchResultsForModel(
 ) {
   if (
     !normalized ||
-    normalized.length === 0
+    normalized.length ===
+      0
   ) {
     return (
       `Web search results for: "${query}"\n\n` +
@@ -3266,11 +3684,12 @@ function formatSearchResultsForModel(
 
   const lines = [
     `Web search results for: "${query}"`,
-    ""
+    "",
   ];
 
   for (
-    const result of normalized
+    const result of
+    normalized
   ) {
     lines.push(
       `[${result.id}]`
@@ -3299,7 +3718,6 @@ function formatSearchResultsForModel(
     .trim();
 }
 
-
 // ============================================================
 // TRUNCATE TEXT
 // ============================================================
@@ -3309,7 +3727,9 @@ function truncateText(
   maxLength
 ) {
   const value =
-    String(text || "");
+    String(
+      text || ""
+    );
 
   if (
     value.length <=
@@ -3319,15 +3739,15 @@ function truncateText(
   }
 
   return (
-    value.slice(
-      0,
-      maxLength
-    )
-    .trim() +
+    value
+      .slice(
+        0,
+        maxLength
+      )
+      .trim() +
     "…"
   );
 }
-
 
 // ============================================================
 // SAFE JSON
@@ -3340,11 +3760,12 @@ function safeParseJSON(
     return JSON.parse(
       text
     );
-  } catch (error) {
+  } catch (
+    error
+  ) {
     return null;
   }
 }
-
 
 // ============================================================
 // TOOL CALL STREAM ACCUMULATION
@@ -3355,25 +3776,34 @@ function mergeToolCallDelta(
   deltaToolCalls
 ) {
   for (
-    const call of deltaToolCalls
+    const call of
+    deltaToolCalls
   ) {
     const index =
       typeof call.index ===
-      "number"
+        "number"
         ? call.index
         : 0;
 
     if (
       !accumulator[index]
     ) {
-      accumulator[index] = {
-        id: "",
-        type: "function",
-        function: {
-          name: "",
-          arguments: ""
-        }
-      };
+      accumulator[index] =
+        {
+          id:
+            "",
+
+          type:
+            "function",
+
+          function: {
+            name:
+              "",
+
+            arguments:
+              "",
+          },
+        };
     }
 
     const entry =
@@ -3408,7 +3838,6 @@ function mergeToolCallDelta(
     }
   }
 }
-
 
 // ============================================================
 // GUEST MODE
@@ -3446,26 +3875,33 @@ async function handleGuestMode(
 
   let messages = [
     {
-      role: "system",
+      role:
+        "system",
+
       content:
         systemPrompt +
-        TOOL_SYSTEM_INSTRUCTIONS
+        TOOL_SYSTEM_INSTRUCTIONS,
     },
+
     {
-      role: "user",
-      content: prompt
-    }
+      role:
+        "user",
+
+      content:
+        prompt,
+    },
   ];
 
   let searchRoundsUsed =
     0;
 
-  let finalAnswer = "";
+  let finalAnswer =
+    "";
 
   for (
     let iteration = 0;
     iteration <
-      MAX_TOOL_LOOP_ITERATIONS;
+    MAX_TOOL_LOOP_ITERATIONS;
     iteration++
   ) {
     const toolsForThisRound =
@@ -3598,11 +4034,14 @@ async function handleGuestMode(
         }
 
         toolResultMessages.push({
-          role: "tool",
+          role:
+            "tool",
+
           tool_call_id:
             call.id,
+
           content:
-            resultText
+            resultText,
         });
       }
 
@@ -3614,14 +4053,18 @@ async function handleGuestMode(
           messages.concat(
             [
               {
-                role: "assistant",
+                role:
+                  "assistant",
+
                 content:
                   assistantMessage.content ||
                   "",
+
                 tool_calls:
-                  assistantToolCalls
-              }
+                  assistantToolCalls,
+              },
             ],
+
             toolResultMessages
           );
 
@@ -3644,7 +4087,6 @@ async function handleGuestMode(
       "I couldn't generate a response.";
   }
 
-  // Guest message delivery.
   await sendChunked(
     token,
     guestChatId,
@@ -3654,7 +4096,6 @@ async function handleGuestMode(
     undefined
   );
 }
-
 
 // ============================================================
 // EXTRACT CONTENT
@@ -3673,7 +4114,6 @@ function extractContent(
   );
 }
 
-
 // ============================================================
 // SPLIT TEXT
 // ============================================================
@@ -3683,7 +4123,9 @@ function splitText(
   limit
 ) {
   const value =
-    String(text || "");
+    String(
+      text || ""
+    );
 
   if (!value) {
     return [];
@@ -3696,12 +4138,15 @@ function splitText(
     return [value];
   }
 
-  const parts = [];
+  const parts =
+    [];
 
-  let start = 0;
+  let start =
+    0;
 
   while (
-    start < value.length
+    start <
+    value.length
   ) {
     let end =
       Math.min(
@@ -3725,17 +4170,14 @@ function splitText(
 
       if (
         newline >
-        start + Math.floor(
-          limit * 0.5
-        )
+        start +
+          Math.floor(
+            limit * 0.5
+          )
       ) {
         end =
           newline + 1;
       } else {
-        // ------------------------------------------------------
-        // Then prefer a space.
-        // ------------------------------------------------------
-
         const space =
           value.lastIndexOf(
             " ",
@@ -3744,9 +4186,10 @@ function splitText(
 
         if (
           space >
-          start + Math.floor(
-            limit * 0.5
-          )
+          start +
+            Math.floor(
+              limit * 0.5
+            )
         ) {
           end =
             space + 1;
@@ -3768,12 +4211,12 @@ function splitText(
       );
     }
 
-    start = end;
+    start =
+      end;
   }
 
   return parts;
 }
-
 
 // ============================================================
 // TIMEOUT HELPER
@@ -3806,7 +4249,7 @@ function withTimeout(
   return Promise.race(
     [
       promise,
-      timeout
+      timeout,
     ]
   ).finally(
     () => {
@@ -3816,7 +4259,6 @@ function withTimeout(
     }
   );
 }
-
 
 // ============================================================
 // SLEEP
@@ -3834,7 +4276,6 @@ function sleep(
   );
 }
 
-
 // ============================================================
 // DRAFT ID
 // ============================================================
@@ -3848,7 +4289,6 @@ function generateDraftId() {
 
   return value;
 }
-
 
 // ============================================================
 // MARKDOWN ESCAPE
@@ -3865,7 +4305,6 @@ function escapeMarkdown(
   );
 }
 
-
 // ============================================================
 // MESSAGE TARGETING
 // ============================================================
@@ -3878,8 +4317,9 @@ function isMentionedOrTriggered(
   botUserId
 ) {
   const value =
-    String(text || "")
-      .trim();
+    String(
+      text || ""
+    ).trim();
 
   if (!value) {
     return false;
@@ -3901,16 +4341,13 @@ function isMentionedOrTriggered(
   const trigger =
     String(
       triggerCommand || ""
-    )
-      .toLowerCase();
+    ).toLowerCase();
 
   // @bot mention.
   if (
     username &&
-    (
-      lower.includes(
-        `@${username}`
-      )
+    lower.includes(
+      `@${username}`
     )
   ) {
     return true;
@@ -3920,7 +4357,8 @@ function isMentionedOrTriggered(
   if (
     trigger &&
     (
-      lower === trigger ||
+      lower ===
+        trigger ||
       lower.startsWith(
         `${trigger} `
       )
@@ -3933,7 +4371,8 @@ function isMentionedOrTriggered(
   if (
     message &&
     message.reply_to_message &&
-    message.reply_to_message.from
+    message.reply_to_message
+      .from
   ) {
     const repliedFrom =
       message.reply_to_message
@@ -3964,7 +4403,6 @@ function isMentionedOrTriggered(
   return false;
 }
 
-
 // ============================================================
 // EXTRACT PROMPT
 // ============================================================
@@ -3976,8 +4414,9 @@ function extractPrompt(
   message
 ) {
   let value =
-    String(text || "")
-      .trim();
+    String(
+      text || ""
+    ).trim();
 
   const username =
     String(
@@ -4025,7 +4464,6 @@ function extractPrompt(
       );
   }
 
-  // Clean leading punctuation/whitespace.
   value =
     value
       .replace(
@@ -4034,19 +4472,18 @@ function extractPrompt(
       )
       .trim();
 
-  // Reply prefix does not require extra text.
   if (
     !value &&
     message &&
     message.reply_to_message &&
-    message.reply_to_message.text
+    message.reply_to_message
+      .text
   ) {
     return "";
   }
 
   return value;
 }
-
 
 // ============================================================
 // ESCAPE REGEXP
@@ -4062,7 +4499,6 @@ function escapeRegExp(
     "\\$&"
   );
 }
-
 
 // ============================================================
 // HISTORY
@@ -4092,7 +4528,9 @@ async function getUserHistory(
     }
 
     const parsed =
-      JSON.parse(raw);
+      JSON.parse(
+        raw
+      );
 
     return Array.isArray(
       parsed
@@ -4108,7 +4546,6 @@ async function getUserHistory(
     return [];
   }
 }
-
 
 // ============================================================
 // SAVE CONVERSATION
@@ -4137,15 +4574,19 @@ async function saveConversation(
       );
 
     existing.push({
-      role: "user",
+      role:
+        "user",
+
       content:
-        userPrompt
+        userPrompt,
     });
 
     existing.push({
-      role: "assistant",
+      role:
+        "assistant",
+
       content:
-        assistantAnswer
+        assistantAnswer,
     });
 
     const trimmed =
@@ -4155,7 +4596,9 @@ async function saveConversation(
 
     await env.CHAT_HISTORY.put(
       key,
-      JSON.stringify(trimmed)
+      JSON.stringify(
+        trimmed
+      )
     );
   } catch (error) {
     console.error(
@@ -4164,7 +4607,6 @@ async function saveConversation(
     );
   }
 }
-
 
 // ============================================================
 // ARRAY BUFFER -> BASE64
@@ -4178,7 +4620,8 @@ function arrayBufferToBase64(
       buffer
     );
 
-  let binary = "";
+  let binary =
+    "";
 
   const chunkSize =
     0x8000;
@@ -4203,5 +4646,14 @@ function arrayBufferToBase64(
       );
   }
 
-  return Buffer.from(binary, "binary").toString("base64");
+  return Buffer.from(
+    binary,
+    "binary"
+  ).toString(
+    "base64"
+  );
 }
+
+// ============================================================
+// END
+// ============================================================
