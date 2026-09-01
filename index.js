@@ -12,9 +12,15 @@
 //   - Normal text requests -> OPENROUTER_MODEL
 //   - Image requests       -> OPENROUTER_VISION_MODEL
 //
+// AI reactions:
+//   - The SAME OpenRouter request selects one reaction.
+//   - Format emitted by model:
+//       <reaction>🤔</reaction>
+//       Actual answer...
+//
 // Image MIME handling:
-//   - Never sends application/octet-stream to OpenRouter
-//   - Detects image type from Telegram's file_path
+//   - Never sends application/octet-stream to OpenRouter.
+//   - Detects image type from Telegram file_path.
 //
 // ============================================================
 
@@ -59,6 +65,8 @@ const OPENROUTER_API =
 const DEFAULT_MODEL =
   "minimax/minimax-m2.7:free";
 
+// Default model for image requests.
+// Can be overridden with OPENROUTER_VISION_MODEL.
 const DEFAULT_VISION_MODEL =
   "openrouter/free";
 
@@ -99,7 +107,7 @@ const EDIT_FAILS_BEFORE_SWITCH =
 
 // Per-read timeout for OpenRouter SSE streams.
 const SSE_CHUNK_TIMEOUT_MS =
-  15_000;
+  15000;
 
 // Number of previous user/assistant pairs.
 const HISTORY_PAIRS =
@@ -110,18 +118,15 @@ const UPDATE_DEDUP_TTL_SECONDS =
   300;
 
 // ------------------------------------------------------------
-// Web search (LangSearch) config
+// Web search config
 // ------------------------------------------------------------
 
 const LANGSEARCH_SEARCH_API =
   "https://api.langsearch.com/v1/web-search";
 
-// Maximum number of actual LangSearch searches allowed per user
-// request.
 const MAX_WEB_SEARCHES =
   3;
 
-// Hard safety cap for model round-trips.
 const MAX_TOOL_LOOP_ITERATIONS =
   MAX_WEB_SEARCHES + 3;
 
@@ -133,6 +138,49 @@ const MAX_RESULT_TITLE_LENGTH =
 
 const MAX_RESULT_CONTENT_LENGTH =
   500;
+
+// ============================================================
+// AI REACTION CONFIG
+// ============================================================
+//
+// Keep the list small and common so Telegram is more likely to
+// support the reaction in ordinary chats.
+//
+// ============================================================
+
+const ALLOWED_REACTIONS =
+  new Set([
+    "👍",
+    "👎",
+    "❤️",
+    "🔥",
+    "😂",
+    "😢",
+    "😡",
+    "🤔",
+    "😮",
+    "🎉",
+    "💯",
+    "👀",
+    "🧠",
+    "🙏",
+    "👏",
+    "💡",
+    "💔",
+    "🤝",
+    "🚀",
+    "✨",
+    "😎",
+    "😭",
+    "🥰",
+    "😴",
+    "🤯",
+    "🧐",
+  ]);
+
+// ============================================================
+// WEB SEARCH TOOL
+// ============================================================
 
 const WEB_SEARCH_TOOLS = [
   {
@@ -171,7 +219,33 @@ const WEB_SEARCH_TOOLS = [
   },
 ];
 
+// ============================================================
+// SYSTEM INSTRUCTIONS
+// ============================================================
+//
+// IMPORTANT:
+//
+// The reaction is emitted BEFORE the normal answer.
+//
+// The parser removes the reaction marker and the user never sees
+// it.
+//
+// ============================================================
+
+const REACTION_SYSTEM_INSTRUCTIONS =
+  "\n\nREACTION INSTRUCTION:\n" +
+  "Before answering the user's message, choose exactly ONE reaction emoji that best matches the user's message, topic, intent, or mood.\n" +
+  "You MUST output the reaction first using exactly this format:\n" +
+  "<reaction>EMOJI</reaction>\n" +
+  "Then immediately write the actual answer.\n" +
+  "Do not write anything before the reaction tag.\n" +
+  "Use exactly one emoji.\n" +
+  "Choose ONLY one emoji from this list:\n" +
+  "👍 👎 ❤️ 🔥 😂 😢 😡 🤔 😮 🎉 💯 👀 🧠 🙏 👏 💡 💔 🤝 🚀 ✨ 😎 😭 🥰 😴 🤯 🧐\n" +
+  "The reaction tag is internal metadata for the bot. Do not discuss it in your answer.";
+
 const TOOL_SYSTEM_INSTRUCTIONS =
+  REACTION_SYSTEM_INSTRUCTIONS +
   "\n\nYou have access to a web_search tool.\n" +
   "- Use it when the user asks for current, recent, live, changing, or time-sensitive information.\n" +
   "- Use it when factual verification from external sources is important.\n" +
@@ -200,9 +274,13 @@ class SimpleKV {
       new Map();
   }
 
-  async get(key) {
+  async get(
+    key
+  ) {
     const entry =
-      this.store.get(key);
+      this.store.get(
+        key
+      );
 
     if (!entry) {
       return null;
@@ -253,7 +331,8 @@ class SimpleKV {
       const [
         key,
         entry,
-      ] of this.store.entries()
+      ] of
+      this.store.entries()
     ) {
       if (
         entry.expiresAt &&
@@ -299,7 +378,7 @@ const env = {
   OPENROUTER_MODEL:
     process.env.OPENROUTER_MODEL,
 
-  // Model used for image requests.
+  // NEW: vision model
   OPENROUTER_VISION_MODEL:
     process.env.OPENROUTER_VISION_MODEL,
 
@@ -327,12 +406,6 @@ const env = {
 
 // ============================================================
 // WEBHOOK PATH
-// ============================================================
-//
-// IMPORTANT:
-// Keep WEBHOOK_PATH_TOKEN stable.
-// Do NOT generate it using Math.random() on each restart.
-//
 // ============================================================
 
 const WEBHOOK_PATH_TOKEN =
@@ -432,7 +505,6 @@ app.post(
       env.WEBHOOK_SECRET;
 
     // Safe diagnostics.
-    // Never log the actual secret.
     console.log(
       "========== TELEGRAM WEBHOOK =========="
     );
@@ -485,8 +557,7 @@ app.post(
 
     if (!expectedSecret) {
       console.error(
-        "WEBHOOK_SECRET is not configured. " +
-          "Rejecting webhook request."
+        "WEBHOOK_SECRET is not configured. Rejecting webhook."
       );
 
       res
@@ -500,8 +571,7 @@ app.post(
 
     if (!secretMatches) {
       console.warn(
-        "Rejected /webhook request with " +
-          "missing/invalid secret token."
+        "Rejected /webhook request with missing/invalid secret token."
       );
 
       res
@@ -520,7 +590,7 @@ app.post(
     const update =
       req.body;
 
-    // Acknowledge Telegram immediately.
+    // ACK Telegram immediately.
     res
       .status(200)
       .send("OK");
@@ -808,9 +878,11 @@ async function processUpdate(
           `${triggerCommand} your question`,
           "or reply to one of my messages.",
           "",
-          "Images are supported.",
+          "Images are supported when the selected vision model supports image input.",
           "",
+          "AI reactions: ON",
           "Streaming: ON",
+          "",
           "Text Model: `" +
             escapeMarkdown(
               env.OPENROUTER_MODEL ||
@@ -861,8 +933,7 @@ async function processUpdate(
       false;
 
     let prompt =
-      text ||
-      caption;
+      text || caption;
 
     let isImage =
       false;
@@ -1057,6 +1128,7 @@ async function handleStart(
         `Vision Model: \`${escapeMarkdown(visionModel)}\``,
         "Provider: OpenRouter",
         "⚡ Live streaming: ON",
+        "✨ AI reactions: ON",
         "",
         "Just send me a message.",
         "",
@@ -1159,6 +1231,22 @@ async function generateAI(
     false;
 
   // ----------------------------------------------------------
+  // AI reaction state
+  // ----------------------------------------------------------
+
+  let aiReaction =
+    null;
+
+  let reactionDetected =
+    false;
+
+  let reactionBuffer =
+    "";
+
+  let reactionFallbackSent =
+    false;
+
+  // ----------------------------------------------------------
   // Rich draft ID
   // ----------------------------------------------------------
 
@@ -1188,6 +1276,48 @@ async function generateAI(
       },
       5000
     );
+
+  // ----------------------------------------------------------
+  // Reaction helper for this generation
+  // ----------------------------------------------------------
+
+  async function applyReaction(
+    emoji
+  ) {
+    if (
+      reactionFallbackSent
+    ) {
+      return;
+    }
+
+    if (
+      !ALLOWED_REACTIONS.has(
+        emoji
+      )
+    ) {
+      return;
+    }
+
+    reactionFallbackSent =
+      true;
+
+    aiReaction =
+      emoji;
+
+    try {
+      await setAIReaction(
+        token,
+        chatId,
+        replyToMessageId,
+        emoji
+      );
+    } catch (error) {
+      console.warn(
+        "AI reaction application failed:",
+        error
+      );
+    }
+  }
 
   // ----------------------------------------------------------
   // Reads one OpenRouter SSE stream.
@@ -1327,9 +1457,9 @@ async function generateAI(
             continue;
           }
 
-          // ----------------------------------------------------
+          // --------------------------------------------------
           // Tool calls
-          // ----------------------------------------------------
+          // --------------------------------------------------
 
           if (
             Array.isArray(
@@ -1342,9 +1472,9 @@ async function generateAI(
             );
           }
 
-          // ----------------------------------------------------
+          // --------------------------------------------------
           // Reasoning
-          // ----------------------------------------------------
+          // --------------------------------------------------
 
           const hasReasoning =
             Boolean(
@@ -1377,9 +1507,9 @@ async function generateAI(
             }
           }
 
-          // ----------------------------------------------------
+          // --------------------------------------------------
           // Content
-          // ----------------------------------------------------
+          // --------------------------------------------------
 
           const content =
             extractContent(
@@ -1390,12 +1520,81 @@ async function generateAI(
             continue;
           }
 
-          fullAnswer +=
-            content;
+          // ==================================================
+          // AI REACTION EXTRACTION
+          // ==================================================
+          //
+          // The model must begin with:
+          //
+          // <reaction>🤔</reaction>
+          //
+          // We keep these tokens hidden from the user.
+          // ==================================================
 
-          // ----------------------------------------------------
+          if (
+            !reactionDetected
+          ) {
+            reactionBuffer +=
+              content;
+
+            const reactionMatch =
+              reactionBuffer.match(
+                /^\s*<reaction>\s*([\s\S]*?)\s*<\/reaction>/i
+              );
+
+            if (
+              reactionMatch
+            ) {
+              const candidate =
+                reactionMatch[1]
+                  .trim();
+
+              if (
+                ALLOWED_REACTIONS.has(
+                  candidate
+                )
+              ) {
+                await applyReaction(
+                  candidate
+                );
+              } else {
+                await applyReaction(
+                  "👍"
+                );
+              }
+
+              reactionDetected =
+                true;
+
+              const remainder =
+                reactionBuffer
+                  .slice(
+                    reactionMatch[0]
+                      .length
+                  );
+
+              reactionBuffer =
+                "";
+
+              if (
+                remainder
+              ) {
+                fullAnswer +=
+                  remainder;
+              }
+            } else {
+              // Keep waiting until the complete reaction marker
+              // arrives. Do NOT expose the metadata.
+              continue;
+            }
+          } else {
+            fullAnswer +=
+              content;
+          }
+
+          // --------------------------------------------------
           // STREAM THROTTLE
-          // ----------------------------------------------------
+          // --------------------------------------------------
 
           const now =
             Date.now();
@@ -1420,9 +1619,9 @@ async function generateAI(
           lastEditChars =
             fullAnswer.length;
 
-          // ====================================================
+          // ==================================================
           // PRIVATE — RICH DRAFT
-          // ====================================================
+          // ==================================================
 
           if (usingRichDraft) {
             const liveText =
@@ -1457,9 +1656,9 @@ async function generateAI(
             continue;
           }
 
-          // ====================================================
+          // ==================================================
           // GROUP — STREAM
-          // ====================================================
+          // ==================================================
 
           if (
             streamMessageIds.length >
@@ -1487,6 +1686,19 @@ async function generateAI(
       console.error(
         "OpenRouter SSE reader failed:",
         error
+      );
+    }
+
+    // --------------------------------------------------------
+    // If the model ignored the reaction protocol completely,
+    // use a harmless fallback.
+    // --------------------------------------------------------
+
+    if (
+      !reactionDetected
+    ) {
+      await applyReaction(
+        "👍"
       );
     }
 
@@ -1658,16 +1870,16 @@ async function generateAI(
       lastEditChars =
         0;
 
+      // NOTE:
+      // Do NOT reset reactionDetected here.
+      // The reaction belongs to the whole user request,
+      // not each individual tool round.
+
       const toolsForThisRound =
         searchRoundsUsed <
         MAX_WEB_SEARCHES
           ? WEB_SEARCH_TOOLS
           : null;
-
-      // ------------------------------------------------------
-      // IMPORTANT:
-      // Select vision model automatically when imageData exists.
-      // ------------------------------------------------------
 
       const response =
         await createOpenRouterRequest(
@@ -1695,6 +1907,17 @@ async function generateAI(
             Boolean(
               imageData
             ),
+
+          selectedModel:
+            imageData
+              ? (
+                  env.OPENROUTER_VISION_MODEL ||
+                  DEFAULT_VISION_MODEL
+                )
+              : (
+                  env.OPENROUTER_MODEL ||
+                  DEFAULT_MODEL
+                ),
         }
       );
 
@@ -1839,7 +2062,6 @@ async function generateAI(
           });
         }
 
-        // No valid tool call.
         if (
           assistantToolCalls.length ===
           0
@@ -1943,6 +2165,22 @@ async function generateAI(
       "generateAI failed:",
       error
     );
+
+    // --------------------------------------------------------
+    // Make sure the user gets a reaction even if generation
+    // fails before the model emitted one.
+    // --------------------------------------------------------
+
+    if (
+      !reactionDetected &&
+      !reactionFallbackSent
+    ) {
+      try {
+        await applyReaction(
+          "👍"
+        );
+      } catch {}
+    }
 
     // --------------------------------------------------------
     // PRIVATE ERROR
@@ -2251,6 +2489,10 @@ async function syncGroupStream(
     return;
   }
 
+  // ----------------------------------------------------------
+  // Non-429 fallback
+  // ----------------------------------------------------------
+
   const markdownEdited =
     await editMarkdownMessage(
       token,
@@ -2336,7 +2578,7 @@ async function switchGroupStreamToNewMessages(
   state.newModeSentLength =
     0;
 
-  return appendNewModeStream(
+  return await appendNewModeStream(
     token,
     chatId,
     fullText,
@@ -2958,8 +3200,9 @@ async function sendNewMessage(
   toRichHtml,
   replyToMessageId
 ) {
-  // The bot uses Telegram Rich Message markdown directly.
-  if (useRich) {
+  if (
+    useRich
+  ) {
     const result =
       await sendRichMessage(
         token,
@@ -3118,6 +3361,62 @@ async function sendChunked(
 
     await sleep(
       50
+    );
+  }
+}
+
+// ============================================================
+// TELEGRAM REACTION
+// ============================================================
+
+async function setAIReaction(
+  token,
+  chatId,
+  messageId,
+  emoji
+) {
+  if (
+    !chatId ||
+    !messageId ||
+    !ALLOWED_REACTIONS.has(
+      emoji
+    )
+  ) {
+    return;
+  }
+
+  const result =
+    await telegramPost(
+      token,
+      "setMessageReaction",
+      {
+        chat_id:
+          chatId,
+
+        message_id:
+          messageId,
+
+        reaction: [
+          {
+            type:
+              "emoji",
+
+            emoji:
+              emoji,
+          },
+        ],
+
+        is_big:
+          false,
+      }
+    );
+
+  if (
+    !result.ok
+  ) {
+    console.warn(
+      "AI reaction failed:",
+      result.description
     );
   }
 }
@@ -3424,18 +3723,10 @@ async function downloadImage(
   // IMPORTANT MIME FIX
   // ==========================================================
   //
-  // Some proxies/hosting environments return:
+  // Some proxies return application/octet-stream even though the
+  // actual downloaded file is a JPEG/PNG/WebP/GIF.
   //
-  //   application/octet-stream
-  //
-  // even though the actual downloaded file is an image.
-  //
-  // OpenRouter does not accept:
-  //
-  //   data:application/octet-stream;base64,...
-  //
-  // So we ONLY accept known image MIME types from the HTTP
-  // response. Otherwise we use Telegram's file extension.
+  // Never pass application/octet-stream to OpenRouter.
   //
   // ==========================================================
 
@@ -3445,7 +3736,9 @@ async function downloadImage(
         "content-type"
       ) || ""
     )
-      .split(";")[0]
+      .split(
+        ";"
+      )[0]
       .trim()
       .toLowerCase();
 
@@ -3552,8 +3845,7 @@ function detectImageMimeType(
     return "image/gif";
   }
 
-  // Telegram photos are normally JPEG even if some intermediary
-  // returns application/octet-stream.
+  // Telegram photos are normally JPEG.
   return "image/jpeg";
 }
 
@@ -3670,15 +3962,6 @@ async function buildMessages(
 
 // ============================================================
 // OPENROUTER
-// ============================================================
-//
-// IMPORTANT:
-// hasImage = true
-//     -> OPENROUTER_VISION_MODEL
-//
-// hasImage = false
-//     -> OPENROUTER_MODEL
-//
 // ============================================================
 
 async function createOpenRouterRequest(
@@ -4382,6 +4665,8 @@ async function handleGuestMode(
       "I couldn't generate a response.";
   }
 
+  // Guest mode is not tied to an incoming Telegram message,
+  // so no Telegram reaction is attempted here.
   await sendChunked(
     token,
     guestChatId,
@@ -4902,5 +5187,47 @@ async function saveConversation(
 }
 
 // ============================================================
-// END
+// ARRAY BUFFER -> BASE64
 // ============================================================
+
+function arrayBufferToBase64(
+  buffer
+) {
+  const bytes =
+    new Uint8Array(
+      buffer
+    );
+
+  let binary =
+    "";
+
+  const chunkSize =
+    0x8000;
+
+  for (
+    let i = 0;
+    i < bytes.length;
+    i += chunkSize
+  ) {
+    const chunk =
+      bytes.subarray(
+        i,
+        Math.min(
+          i + chunkSize,
+          bytes.length
+        )
+      );
+
+    binary +=
+      String.fromCharCode(
+        ...chunk
+      );
+  }
+
+  return Buffer.from(
+    binary,
+    "binary"
+  ).toString(
+    "base64"
+  );
+}
