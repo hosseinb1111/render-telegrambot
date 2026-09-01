@@ -4,62 +4,221 @@ import express from "express";
 // CONFIG
 // ============================================================
 
-const TG = "https://api.telegram.org";
-const OR = "https://openrouter.ai/api/v1/chat/completions";
+const TG_BASE = "https://api.telegram.org";
+const OR_URL = "https://openrouter.ai/api/v1/chat/completions";
+const LANGSEARCH_URL = "https://api.langsearch.com/v1/web-search";
 
 const TEXT_MODEL = process.env.OPENROUTER_MODEL || "minimax/minimax-m2.7:free";
 const VISION_MODEL = process.env.OPENROUTER_VISION_MODEL || "openrouter/free";
 const FILE_MODEL = process.env.OPENROUTER_FILE_MODEL || "openrouter/free";
+const FAST_MODEL = process.env.OPENROUTER_FAST_MODEL || TEXT_MODEL;
+const DEEP_MODEL = process.env.OPENROUTER_DEEP_MODEL || TEXT_MODEL;
 
-const PORT = process.env.PORT || 3000;
-const WEBHOOK_PATH_TOKEN = process.env.WEBHOOK_PATH_TOKEN || "change-this-token";
-const WEBHOOK_PATH = `/webhook/${WEBHOOK_PATH_TOKEN}`;
+const PORT = Number(process.env.PORT || 3000);
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const OR_KEY = process.env.OPENROUTER_API_KEY;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
+const OR_KEY = process.env.OPENROUTER_API_KEY || "";
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+const WEBHOOK_PATH_TOKEN = process.env.WEBHOOK_PATH_TOKEN || "";
 
-const BOT_USERNAME = process.env.BOT_USERNAME || "";
-const TRIGGER = process.env.TRIGGER_COMMAND || "!ai";
+const WEBHOOK_PATH = WEBHOOK_PATH_TOKEN
+  ? `/webhook/${encodeURIComponent(WEBHOOK_PATH_TOKEN)}`
+  : "/__missing_webhook_path__";
+
+const BOT_USERNAME = String(process.env.BOT_USERNAME || "").replace(/^@/, "");
+const TRIGGER = String(process.env.TRIGGER_COMMAND || "!ai").trim();
+
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   "You are a helpful AI assistant. Answer accurately, clearly, naturally, and concisely.";
 
-const LANGSEARCH_KEY = process.env.LANGSEARCH_API_KEY;
-const GUEST_SECRET = process.env.GUEST_API_SECRET;
+const LANGSEARCH_KEY = process.env.LANGSEARCH_API_KEY || "";
+const GUEST_SECRET = process.env.GUEST_API_SECRET || "";
 
-const MAX_SEARCHES = 3;
-const HISTORY_PAIRS = 4;
+const HISTORY_PAIRS = clampInt(
+  process.env.HISTORY_PAIRS,
+  4,
+  1,
+  20
+);
+
+const MAX_SEARCHES = clampInt(
+  process.env.MAX_SEARCHES,
+  3,
+  1,
+  5
+);
+
+const MAX_TOOL_ROUNDS = clampInt(
+  process.env.MAX_TOOL_ROUNDS,
+  4,
+  1,
+  6
+);
+
+const MAX_FILE_BYTES = 15 * 1024 * 1024;
+const MAX_TEXT_FILE_CHARS = 50000;
+
 const TG_LIMIT = 4096;
-const RICH_LIMIT = 32768;
+const SAFE_STREAM_LIMIT = 3800;
+
+const FETCH_TIMEOUT_MS = 30000;
+const STREAM_FETCH_TIMEOUT_MS = 120000;
+
+const TG_RETRY_MAX = 2;
+const UPDATE_TTL_SECONDS = 300;
+
+const ADMIN_IDS = new Set(
+  String(process.env.ADMIN_IDS || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+);
 
 let botId = null;
+let botUsernameRuntime = BOT_USERNAME;
 
 // ============================================================
-// SIMPLE MEMORY
+// STATE / MEMORY
 // ============================================================
 
 const mem = new Map();
+const prefs = new Map();
+const generationLocks = new Map();
+const lastReactions = new Map();
 
-function memGet(k) {
-  const x = mem.get(k);
-  if (!x) return null;
-  if (x.expires && Date.now() > x.expires) {
-    mem.delete(k);
+function clampInt(value, fallback, min, max) {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function memGet(key) {
+  const item = mem.get(key);
+
+  if (!item) {
     return null;
   }
-  return x.value;
+
+  if (item.expires && Date.now() > item.expires) {
+    mem.delete(key);
+    return null;
+  }
+
+  return item.value;
 }
 
-function memSet(k, value, ttl = 0) {
-  mem.set(k, { value, expires: ttl ? Date.now() + ttl * 1000 : 0 });
+function memSet(key, value, ttlSeconds = 0) {
+  mem.set(key, {
+    value,
+    expires: ttlSeconds
+      ? Date.now() + ttlSeconds * 1000
+      : 0,
+  });
 }
 
-setInterval(() => {
-  for (const [k, x] of mem) {
-    if (x.expires && Date.now() > x.expires) mem.delete(k);
+const cleanupTimer = setInterval(() => {
+  const now = Date.now();
+
+  for (const [key, item] of mem) {
+    if (item.expires && now > item.expires) {
+      mem.delete(key);
+    }
+  }
+
+  for (const [key, item] of lastReactions) {
+    if (now - item.at > 30 * 60 * 1000) {
+      lastReactions.delete(key);
+    }
   }
 }, 300000);
+
+cleanupTimer.unref?.();
+
+function setPref(userId, key, value) {
+  const id = String(userId);
+  const p = prefs.get(id) || {};
+
+  p[key] = String(value).slice(0, 300);
+
+  prefs.set(id, p);
+}
+
+function getPref(userId, key) {
+  return prefs.get(String(userId))?.[key];
+}
+
+async function getHistory(userId) {
+  const raw = memGet(`history:${userId}`);
+
+  if (!raw) {
+    return [];
+  }
+
+  try {
+    const parsed = Array.isArray(raw)
+      ? raw
+      : JSON.parse(raw);
+
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed
+      .filter(
+        (message) =>
+          message &&
+          (message.role === "user" ||
+            message.role === "assistant") &&
+          typeof message.content !== "undefined"
+      )
+      .slice(-HISTORY_PAIRS * 2);
+  } catch {
+    mem.delete(`history:${userId}`);
+    return [];
+  }
+}
+
+async function saveHistory(userId, prompt, answer) {
+  const history = await getHistory(userId);
+
+  history.push({
+    role: "user",
+    content: String(prompt || "").slice(0, 12000),
+  });
+
+  history.push({
+    role: "assistant",
+    content: String(answer || "").slice(0, 24000),
+  });
+
+  memSet(
+    `history:${userId}`,
+    history.slice(-HISTORY_PAIRS * 2)
+  );
+}
+
+async function runSerialized(key, task) {
+  const previous = generationLocks.get(key) || Promise.resolve();
+
+  const current = previous
+    .catch(() => {})
+    .then(task);
+
+  generationLocks.set(key, current);
+
+  try {
+    return await current;
+  } finally {
+    if (generationLocks.get(key) === current) {
+      generationLocks.delete(key);
+    }
+  }
+}
 
 // ============================================================
 // METRICS
@@ -76,16 +235,40 @@ const stats = {
   totalMs: [],
 };
 
-function avg(a) {
-  return a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length) : 0;
+function recordMetric(list, value, max = 500) {
+  if (!Number.isFinite(value)) {
+    return;
+  }
+
+  list.push(
+    Math.max(0, Math.round(value))
+  );
+
+  if (list.length > max) {
+    list.splice(0, list.length - max);
+  }
 }
 
-function statusText() {
-  const up = Math.floor((Date.now() - stats.started) / 1000);
-  return [
+function avg(values) {
+  if (!values.length) {
+    return 0;
+  }
+
+  return Math.round(
+    values.reduce((sum, n) => sum + n, 0) /
+      values.length
+  );
+}
+
+function statusText(isAdmin = false) {
+  const uptime = Math.floor(
+    (Date.now() - stats.started) / 1000
+  );
+
+  const lines = [
     "🤖 *Bot Status*",
     "",
-    `Uptime: ${up}s`,
+    `Uptime: ${uptime}s`,
     `Requests: ${stats.requests}`,
     `Errors: ${stats.errors}`,
     `Searches: ${stats.searches}`,
@@ -93,313 +276,1299 @@ function statusText() {
     `Files: ${stats.files}`,
     `Avg first token: ${avg(stats.firstTokenMs)}ms`,
     `Avg total: ${avg(stats.totalMs)}ms`,
-    "",
-    `Text: \`${esc(TEXT_MODEL)}\``,
-    `Vision: \`${esc(VISION_MODEL)}\``,
-    `File: \`${esc(FILE_MODEL)}\``,
-  ].join("\n");
+    `Search configured: ${LANGSEARCH_KEY ? "yes" : "no"}`,
+  ];
+
+  if (isAdmin) {
+    lines.push(
+      "",
+      `Text: \`${esc(TEXT_MODEL)}\``,
+      `Fast: \`${esc(FAST_MODEL)}\``,
+      `Deep: \`${esc(DEEP_MODEL)}\``,
+      `Vision: \`${esc(VISION_MODEL)}\``,
+      `File: \`${esc(FILE_MODEL)}\``,
+      `History: ${HISTORY_PAIRS} pairs`,
+      `Max searches/request: ${MAX_SEARCHES}`
+    );
+  }
+
+  return lines.join("\n");
 }
 
 // ============================================================
-// REACTIONS
+// SMART LOCAL REACTIONS
 // ============================================================
 
 const RX = [
-  "👍","👎","❤️","🔥","😂","😢","😡","🤔","😮","🎉","💯","👀",
-  "🧠","🙏","👏","💡","💔","🤝","🚀","✨","😎","😭","🥰","😴","🤯","🧐"
+  "👍",
+  "👎",
+  "❤️",
+  "🔥",
+  "😂",
+  "😢",
+  "😡",
+  "🤔",
+  "😮",
+  "🎉",
+  "💯",
+  "👀",
+  "🧠",
+  "🙏",
+  "👏",
+  "💡",
+  "💔",
+  "🤝",
+  "🚀",
+  "✨",
+  "😎",
+  "😭",
+  "🥰",
+  "😴",
+  "🤯",
+  "🧐",
 ];
 
-const P = {
+const RX_PATTERNS = {
   love: /love|adorable|beautiful|cute|sweet|❤️|😍|🥰|عاشق|عشق|قشنگ|ناز|دوست دارم/i,
+
   praise: /good job|well done|nice job|great job|awesome|amazing|excellent|perfect|thank you|thanks|ممنون|مرسی|دمت گرم|عالی|فوق.?العاده/i,
+
   hype: /excited|can't wait|lets go|let's go|insane|huge|🔥|بزن بریم|هیجان/i,
+
   sad: /sad|depressed|crying|heartbroken|lost|miss|upset|disappointed|😭|😢|غمگین|ناراحتم|گریه|دلتنگ|ناامید/i,
+
   angry: /angry|furious|pissed|hate|wtf|bullshit|😡|🤬|عصبانی|اعصابم|لعنت|مزخرف|افتضاح/i,
+
   funny: /lol|lmao|rofl|haha+|hehe+|funny|joke|😂|🤣|خنده|جوک|باحال/i,
+
   surprise: /no way|really\?|seriously\?|unbelievable|shocking|🤯|😮|جدی؟|واقعا؟|چی؟|باورم نمیشه/i,
+
   help: /help|can you|could you|please|how do i|how can i|show me|fix this|teach me|کمک|میشه|میتونی|لطفا|چطور|چجوری|درستش کن/i,
+
   code: /code|coding|program|programming|developer|debug|bug|error|exception|javascript|typescript|python|java|react|node|html|css|api|sql|github|git|docker|kubernetes|cloudflare|render|webhook|کد|برنامه.?نویسی|باگ|خطا|پایتون|جاوااسکریپت/i,
+
   science: /physics|chemistry|biology|quantum|science|math|mathematics|space|black hole|genetics|فیزیک|شیمی|زیست|علم|کوانتوم|ریاضی|فضا/i,
+
   money: /money|price|cost|budget|stock|crypto|bitcoin|ethereum|dollar|euro|forex|invest|business|salary|profit|قیمت|پول|سهام|کریپتو|بیت.?کوین|دلار|یورو|سرمایه|کسب.?و.?کار|حقوق/i,
+
   news: /latest|breaking|news|today|recent|current|what happened|update|election|president|war|اخبار|امروز|جدیدترین|آخرین|جنگ|انتخابات|خبر جدید/i,
+
   travel: /travel|trip|flight|hotel|vacation|tourist|tourism|visa|airport|passport|سفر|پرواز|هتل|تعطیلات|ویزا|فرودگاه|پاسپورت/i,
+
   food: /food|cook|cooking|recipe|restaurant|dinner|lunch|breakfast|pizza|burger|coffee|tea|غذا|آشپزی|دستور.?غذا|رستوران|پیتزا|برگر|قهوه|چای/i,
+
   relationship: /relationship|girlfriend|boyfriend|wife|husband|crush|date|love|breakup|friendship|رابطه|دوست.?دختر|دوست.?پسر|همسر|عشق|جدایی|کراش|دوستی/i,
 };
 
-function reaction(text, image = false) {
-  const s = String(text || "").trim();
-  if (image && !s) return "👀";
+function reactionScores(text, image) {
+  const input = String(text || "").trim();
 
-  const score = Object.fromEntries(RX.map(x => [x, 0]));
-  const hit = (r) => r.test(s) ? 1 : 0;
+  const score = Object.fromEntries(
+    RX.map((emoji) => [emoji, 0])
+  );
 
-  if (/😂|🤣|haha+|lol|lmao/i.test(s)) score["😂"] += 20;
-  if (/😭|😢|sad|depressed|غمگین|ناراحت/i.test(s)) score["😢"] += 20;
-  if (/😡|🤬|angry|furious|عصبانی/i.test(s)) score["😡"] += 20;
-  if (/❤️|😍|🥰|love|عشق/i.test(s)) score["❤️"] += 20;
-  if (/🔥|excited|بزن بریم/i.test(s)) score["🔥"] += 15;
-  if (/🤯|😮|😲|no way|جدی؟/i.test(s)) score["😮"] += 18;
-  if (/🙏|please|لطفا|کمک/i.test(s)) score["🙏"] += 8;
+  const hit = (name) =>
+    RX_PATTERNS[name].test(input)
+      ? 1
+      : 0;
 
-  score["❤️"] += hit(P.love) * 5;
-  score["💯"] += hit(P.praise) * 4;
-  score["👏"] += hit(P.praise) * 2;
-  score["🔥"] += hit(P.hype) * 5;
-  score["🚀"] += hit(P.hype) * 2;
-  score["😢"] += hit(P.sad) * 6;
-  score["😭"] += hit(P.sad) * 2;
-  score["😡"] += hit(P.angry) * 7;
-  score["😂"] += hit(P.funny) * 7;
-  score["😮"] += hit(P.surprise) * 6;
-  score["🤔"] += hit(P.help) * 4;
-  score["💡"] += hit(P.code) * 4;
-  score["🧠"] += hit(P.code) * 3;
-  score["🧠"] += hit(P.science) * 5;
-  score["💡"] += hit(P.science) * 2;
-  score["🧐"] += hit(P.money) * 5;
-  score["💯"] += hit(P.money) * 2;
-  score["🧐"] += hit(P.news) * 6;
-  score["👀"] += hit(P.news) * 2;
-  score["✨"] += hit(P.travel) * 5;
-  score["👀"] += hit(P.travel) * 2;
-  score["❤️"] += hit(P.food) * 3;
-  score["❤️"] += hit(P.relationship) * 5;
-  score["💔"] += hit(P.relationship) * 3;
-
-  if (/[?؟]/.test(s)) score["🤔"] += 4;
-  if (/[!！]{2,}/.test(s)) score["🔥"] += 3;
-  if (image) score["👀"] += 7;
-
-  let best = "👍", bestScore = 0;
-  for (const x of RX) {
-    if (score[x] > bestScore) {
-      best = x;
-      bestScore = score[x];
-    }
+  // Strong emotional signals intentionally dominate
+  // topic-based signals.
+  if (/😂|🤣|haha+|lol|lmao/i.test(input)) {
+    score["😂"] += 30;
   }
-  return best;
+
+  if (/😭|😢|sad|depressed|غمگین|ناراحت|گریه/i.test(input)) {
+    score["😢"] += 30;
+  }
+
+  if (/😡|🤬|angry|furious|عصبانی|اعصابم/i.test(input)) {
+    score["😡"] += 30;
+  }
+
+  if (/❤️|😍|🥰|love|عشق/i.test(input)) {
+    score["❤️"] += 28;
+  }
+
+  if (/🤯|😮|😲|no way|جدی؟|واقعا؟/i.test(input)) {
+    score["😮"] += 26;
+  }
+
+  score["❤️"] += hit("love") * 7;
+
+  score["💯"] += hit("praise") * 5;
+  score["👏"] += hit("praise") * 3;
+
+  score["🔥"] += hit("hype") * 6;
+  score["🚀"] += hit("hype") * 2;
+
+  score["😢"] += hit("sad") * 8;
+  score["😭"] += hit("sad") * 3;
+
+  score["😡"] += hit("angry") * 8;
+
+  score["😂"] += hit("funny") * 8;
+
+  score["😮"] += hit("surprise") * 7;
+
+  score["🤔"] += hit("help") * 4;
+
+  score["💡"] += hit("code") * 4;
+  score["🧠"] += hit("code") * 3;
+
+  score["🧠"] += hit("science") * 5;
+  score["💡"] += hit("science") * 2;
+
+  score["🧐"] += hit("money") * 5;
+  score["💯"] += hit("money") * 2;
+
+  score["🧐"] += hit("news") * 6;
+  score["👀"] += hit("news") * 2;
+
+  score["✨"] += hit("travel") * 5;
+  score["👀"] += hit("travel") * 2;
+
+  score["❤️"] += hit("food") * 3;
+
+  score["❤️"] += hit("relationship") * 5;
+  score["💔"] += hit("relationship") * 3;
+
+  if (/[?؟]/.test(input)) {
+    score["🤔"] += 4;
+  }
+
+  if (/[!！]{2,}/.test(input)) {
+    score["🔥"] += 3;
+  }
+
+  if (image) {
+    score["👀"] += 7;
+  }
+
+  if (!input && image) {
+    score["👀"] += 12;
+  }
+
+  return score;
+}
+
+function chooseReaction(text, image = false, chatKey = "") {
+  const scores = reactionScores(text, image);
+
+  const ordered = RX
+    .map((emoji, index) => ({
+      emoji,
+      score: scores[emoji] || 0,
+      index,
+    }))
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        a.index - b.index
+    );
+
+  const previous =
+    lastReactions.get(String(chatKey))?.emoji;
+
+  let selected =
+    ordered[0]?.emoji || "👍";
+
+  if (
+    previous &&
+    selected === previous &&
+    ordered[1] &&
+    ordered[1].score >=
+      Math.max(1, ordered[0].score - 3)
+  ) {
+    selected = ordered[1].emoji;
+  }
+
+  lastReactions.set(String(chatKey), {
+    emoji: selected,
+    at: Date.now(),
+  });
+
+  return selected;
 }
 
 // ============================================================
-// TELEGRAM
+// TELEGRAM HTTP
 // ============================================================
 
-async function tg(method, body) {
+function tgUrl(method) {
+  return `${TG_BASE}/bot${BOT_TOKEN}/${method}`;
+}
+
+function parseJsonSafely(text) {
   try {
-    const r = await fetch(`${TG}/bot${BOT_TOKEN}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const text = await r.text();
-    let data;
-    try { data = JSON.parse(text); }
-    catch { data = { ok: false, description: text }; }
-
-    if (!r.ok) {
-      const retry =
-        r.status === 429 ? data?.parameters?.retry_after : null;
-
-      if (retry && retry <= 10) {
-        await sleep(retry * 1000);
-        return tg(method, body);
-      }
-    }
-    return data;
-  } catch (e) {
-    return { ok: false, description: String(e) };
+    return JSON.parse(text);
+  } catch {
+    return null;
   }
+}
+
+async function tg(method, body, options = {}) {
+  if (!BOT_TOKEN) {
+    return {
+      ok: false,
+      description: "BOT_TOKEN is not configured",
+    };
+  }
+
+  const maxAttempts = Number.isFinite(
+    options.maxAttempts
+  )
+    ? options.maxAttempts
+    : TG_RETRY_MAX;
+
+  let last = {
+    ok: false,
+    description: "Telegram request failed",
+  };
+
+  for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(
+        tgUrl(method),
+        {
+          method: "POST",
+
+          headers: {
+            "content-type": "application/json",
+          },
+
+          body: JSON.stringify(body),
+
+          signal: AbortSignal.timeout(
+            options.timeoutMs ||
+              FETCH_TIMEOUT_MS
+          ),
+        }
+      );
+
+      const raw = await response.text();
+
+      const data =
+        parseJsonSafely(raw) || {
+          ok: false,
+          description: raw.slice(0, 1000),
+        };
+
+      last = data;
+
+      if (response.ok && data.ok) {
+        return data;
+      }
+
+      const retryAfter = Number(
+        data?.parameters?.retry_after || 0
+      );
+
+      const serverRetry =
+        response.status >= 500 &&
+        response.status <= 599;
+
+      const canRetry =
+        attempt < maxAttempts &&
+        (retryAfter > 0 || serverRetry);
+
+      if (!canRetry) {
+        return data;
+      }
+
+      const delay =
+        retryAfter > 0
+          ? Math.min(
+              retryAfter * 1000,
+              10000
+            )
+          : Math.min(
+              500 * 2 ** attempt,
+              3000
+            );
+
+      await sleep(delay);
+    } catch (error) {
+      last = {
+        ok: false,
+        description:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      };
+
+      if (attempt >= maxAttempts) {
+        break;
+      }
+
+      await sleep(
+        Math.min(
+          500 * 2 ** attempt,
+          3000
+        )
+      );
+    }
+  }
+
+  return last;
 }
 
 async function sendMessage(chatId, text, replyTo) {
   const body = {
     chat_id: chatId,
-    text,
+    text: String(text || "").slice(
+      0,
+      SAFE_STREAM_LIMIT
+    ),
+  };
+
+  if (replyTo) {
+    body.reply_parameters = {
+      message_id: replyTo,
+    };
+  }
+
+  const richBody = {
+    ...body,
     parse_mode: "Markdown",
   };
-  if (replyTo) body.reply_to_message_id = replyTo;
 
-  let r = await tg("sendMessage", body);
-  if (!r.ok) {
-    const plain = { chat_id: chatId, text };
-    if (replyTo) plain.reply_to_message_id = replyTo;
-    r = await tg("sendMessage", plain);
+  let result = await tg(
+    "sendMessage",
+    richBody
+  );
+
+  if (!result.ok) {
+    result = await tg(
+      "sendMessage",
+      body
+    );
   }
-  return r;
+
+  return result;
 }
 
 async function sendPlain(chatId, text, replyTo) {
-  const body = { chat_id: chatId, text };
-  if (replyTo) body.reply_to_message_id = replyTo;
+  const body = {
+    chat_id: chatId,
+    text: String(text || "").slice(
+      0,
+      SAFE_STREAM_LIMIT
+    ),
+  };
+
+  if (replyTo) {
+    body.reply_parameters = {
+      message_id: replyTo,
+    };
+  }
+
   return tg("sendMessage", body);
 }
 
 async function editMessage(chatId, messageId, text) {
-  return tg("editMessageText", {
-    chat_id: chatId,
-    message_id: messageId,
-    text,
-  });
-}
+  const value = String(text || "").slice(
+    0,
+    SAFE_STREAM_LIMIT
+  );
 
-async function typing(chatId) {
-  return tg("sendChatAction", {
-    chat_id: chatId,
-    action: "typing",
-  });
-}
-
-async function reactMessage(chatId, messageId, emoji) {
-  if (!ALLOWED_REACTION(emoji)) return;
-  const r = await tg("setMessageReaction", {
-    chat_id: chatId,
-    message_id: messageId,
-    reaction: [{ type: "emoji", emoji }],
-    is_big: false,
-  });
-  if (!r.ok) console.warn("Reaction failed:", r.description);
-}
-
-function ALLOWED_REACTION(x) {
-  return RX.includes(x);
-}
-
-// ============================================================
-// MEMORY / PREFERENCES
-// ============================================================
-
-async function getHistory(userId) {
-  try {
-    const x = memGet(`history:${userId}`);
-    return x ? JSON.parse(x) : [];
-  } catch {
-    return [];
+  if (!value) {
+    return {
+      ok: false,
+      description: "Empty message",
+    };
   }
-}
 
-async function saveHistory(userId, prompt, answer) {
-  const h = await getHistory(userId);
-  h.push({ role: "user", content: prompt });
-  h.push({ role: "assistant", content: answer });
-  memSet(
-    `history:${userId}`,
-    JSON.stringify(h.slice(-HISTORY_PAIRS * 2))
+  const rich = await tg(
+    "editMessageText",
+    {
+      chat_id: chatId,
+      message_id: messageId,
+      text: value,
+      parse_mode: "Markdown",
+    }
+  );
+
+  if (
+    rich.ok ||
+    /message is not modified/i.test(
+      rich.description || ""
+    )
+  ) {
+    return rich;
+  }
+
+  return tg(
+    "editMessageText",
+    {
+      chat_id: chatId,
+      message_id: messageId,
+      text: value,
+    }
   );
 }
 
-const prefs = new Map();
-
-function setPref(userId, key, value) {
-  const p = prefs.get(userId) || {};
-  p[key] = value;
-  prefs.set(userId, p);
+async function typing(chatId) {
+  return tg(
+    "sendChatAction",
+    {
+      chat_id: chatId,
+      action: "typing",
+    },
+    {
+      maxAttempts: 0,
+      timeoutMs: 10000,
+    }
+  );
 }
 
-function getPref(userId, key) {
-  return prefs.get(userId)?.[key];
+async function reactMessage(
+  chatId,
+  messageId,
+  emoji
+) {
+  if (!RX.includes(emoji)) {
+    return;
+  }
+
+  const result = await tg(
+    "setMessageReaction",
+    {
+      chat_id: chatId,
+      message_id: messageId,
+      reaction: [
+        {
+          type: "emoji",
+          emoji,
+        },
+      ],
+      is_big: false,
+    },
+    {
+      maxAttempts: 0,
+      timeoutMs: 10000,
+    }
+  );
+
+  if (!result.ok) {
+    console.warn(
+      "Reaction unavailable:",
+      result.description ||
+        "unknown error"
+    );
+  }
+}
+
+async function sendPrivateDraft(
+  chatId,
+  draftIdValue,
+  text
+) {
+  return tg(
+    "sendMessageDraft",
+    {
+      chat_id: chatId,
+      draft_id: draftIdValue,
+      text: String(text || "").slice(
+        0,
+        SAFE_STREAM_LIMIT
+      ),
+      parse_mode: "Markdown",
+    },
+    {
+      maxAttempts: 0,
+      timeoutMs: 10000,
+    }
+  );
 }
 
 // ============================================================
 // FILES / IMAGES
 // ============================================================
 
-async function telegramFile(fileId) {
-  const r = await tg("getFile", { file_id: fileId });
-  if (!r.ok) throw new Error(r.description || "getFile failed");
+function normalizeMime(value) {
+  return String(value || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+}
 
-  const path = r.result.file_path;
-  const res = await fetch(`${TG}/file/bot${BOT_TOKEN}/${path}`);
-  if (!res.ok) throw new Error(`File download failed: ${res.status}`);
-
-  const buffer = await res.arrayBuffer();
-  let mime = (res.headers.get("content-type") || "")
-    .split(";")[0]
+function mimeFromExtension(path) {
+  const value = String(path || "")
     .toLowerCase();
 
-  if (!mime.startsWith("image/") || mime === "application/octet-stream") {
-    mime = imageMime(path);
+  if (
+    value.endsWith(".jpg") ||
+    value.endsWith(".jpeg")
+  ) {
+    return "image/jpeg";
   }
+
+  if (value.endsWith(".png")) {
+    return "image/png";
+  }
+
+  if (value.endsWith(".webp")) {
+    return "image/webp";
+  }
+
+  if (value.endsWith(".gif")) {
+    return "image/gif";
+  }
+
+  if (value.endsWith(".pdf")) {
+    return "application/pdf";
+  }
+
+  if (value.endsWith(".txt")) {
+    return "text/plain";
+  }
+
+  if (value.endsWith(".md")) {
+    return "text/markdown";
+  }
+
+  if (value.endsWith(".csv")) {
+    return "text/csv";
+  }
+
+  if (value.endsWith(".json")) {
+    return "application/json";
+  }
+
+  if (value.endsWith(".xml")) {
+    return "application/xml";
+  }
+
+  if (
+    value.endsWith(".html") ||
+    value.endsWith(".htm")
+  ) {
+    return "text/html";
+  }
+
+  if (value.endsWith(".css")) {
+    return "text/css";
+  }
+
+  if (value.endsWith(".js")) {
+    return "text/javascript";
+  }
+
+  if (value.endsWith(".ts")) {
+    return "text/typescript";
+  }
+
+  if (value.endsWith(".py")) {
+    return "text/x-python";
+  }
+
+  if (value.endsWith(".java")) {
+    return "text/x-java-source";
+  }
+
+  if (value.endsWith(".log")) {
+    return "text/plain";
+  }
+
+  return "";
+}
+
+function sniffImageMime(buffer) {
+  if (!buffer || buffer.length < 12) {
+    return "";
+  }
+
+  if (
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff
+  ) {
+    return "image/jpeg";
+  }
+
+  if (
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+
+  if (
+    buffer.subarray(0, 4).toString("ascii") ===
+      "RIFF" &&
+    buffer
+      .subarray(8, 12)
+      .toString("ascii") ===
+      "WEBP"
+  ) {
+    return "image/webp";
+  }
+
+  const gifHeader = buffer
+    .subarray(0, 6)
+    .toString("ascii");
+
+  if (
+    gifHeader === "GIF87a" ||
+    gifHeader === "GIF89a"
+  ) {
+    return "image/gif";
+  }
+
+  return "";
+}
+
+function supportedImageMime(mime) {
+  return [
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+  ].includes(mime);
+}
+
+async function telegramFile(fileId) {
+  const result = await tg(
+    "getFile",
+    {
+      file_id: fileId,
+    }
+  );
+
+  if (
+    !result.ok ||
+    !result.result?.file_path
+  ) {
+    throw new Error(
+      result.description ||
+        "Telegram getFile failed"
+    );
+  }
+
+  const path = String(
+    result.result.file_path
+  );
+
+  const response = await fetch(
+    `${TG_BASE}/file/bot${BOT_TOKEN}/${path}`,
+    {
+      signal:
+        AbortSignal.timeout(
+          FETCH_TIMEOUT_MS
+        ),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `File download failed (${response.status})`
+    );
+  }
+
+  const buffer = Buffer.from(
+    await response.arrayBuffer()
+  );
+
+  if (buffer.length > MAX_FILE_BYTES) {
+    throw new Error(
+      "File is too large for this bot"
+    );
+  }
+
+  const headerMime = normalizeMime(
+    response.headers.get(
+      "content-type"
+    )
+  );
+
+  const extensionMime =
+    mimeFromExtension(path);
+
+  const sniffedMime =
+    sniffImageMime(buffer);
 
   return {
     buffer,
     path,
-    mime,
-    base64: Buffer.from(buffer).toString("base64"),
+    headerMime,
+    extensionMime,
+    sniffedMime,
+    mime:
+      headerMime ||
+      extensionMime ||
+      sniffedMime ||
+      "",
+    base64:
+      buffer.toString("base64"),
   };
 }
 
-function imageMime(path) {
-  const x = String(path || "").toLowerCase();
-  if (x.endsWith(".png")) return "image/png";
-  if (x.endsWith(".webp")) return "image/webp";
-  if (x.endsWith(".gif")) return "image/gif";
-  return "image/jpeg";
-}
+async function telegramImage(fileId) {
+  const file = await telegramFile(fileId);
 
-function decodeTextFile(buffer, path = "") {
-  const ext = path.toLowerCase().split(".").pop();
-  if (["txt","md","json","csv","js","ts","py","java","html","css","log"].includes(ext)) {
-    return Buffer.from(buffer).toString("utf8");
+  const candidates = [
+    file.sniffedMime,
+    file.headerMime,
+    file.extensionMime,
+  ];
+
+  const mime = candidates.find(
+    supportedImageMime
+  ) || "";
+
+  if (!mime) {
+    throw new Error(
+      "Unsupported or unidentified image format. Use JPEG, PNG, WEBP, or GIF."
+    );
   }
-  return null;
+
+  if (
+    file.sniffedMime &&
+    file.sniffedMime !== mime
+  ) {
+    throw new Error(
+      "Image content type does not match its file data."
+    );
+  }
+
+  return {
+    ...file,
+    mime,
+  };
+}
+
+function decodeTextFile(
+  buffer,
+  fileName = ""
+) {
+  const name = String(
+    fileName || ""
+  ).toLowerCase();
+
+  const textExtensions = [
+    ".txt",
+    ".md",
+    ".json",
+    ".csv",
+    ".js",
+    ".ts",
+    ".py",
+    ".java",
+    ".html",
+    ".htm",
+    ".css",
+    ".xml",
+    ".log",
+  ];
+
+  if (
+    !textExtensions.some(
+      (ext) => name.endsWith(ext)
+    )
+  ) {
+    return null;
+  }
+
+  return buffer
+    .toString(
+      "utf8",
+      0,
+      Math.min(
+        buffer.length,
+        MAX_TEXT_FILE_CHARS * 2
+      )
+    )
+    .slice(
+      0,
+      MAX_TEXT_FILE_CHARS
+    );
+}
+
+function isSupportedFileMime(mime) {
+  return [
+    "application/pdf",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "application/json",
+    "application/xml",
+    "text/xml",
+    "text/html",
+    "text/css",
+    "text/javascript",
+    "text/typescript",
+    "text/x-python",
+    "text/x-java-source",
+  ].includes(
+    normalizeMime(mime)
+  );
 }
 
 // ============================================================
-// WEB SEARCH
+// SEARCH
 // ============================================================
 
-const SEARCH_TOOL = [{
-  type: "function",
-  function: {
-    name: "web_search",
-    description: "Search the web for current or externally verifiable information.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string" }
+const SEARCH_TOOL = [
+  {
+    type: "function",
+
+    function: {
+      name: "web_search",
+
+      description:
+        "Search the web when the user asks for current, recent, live, changing, or externally verifiable information. Use concise targeted queries.",
+
+      parameters: {
+        type: "object",
+
+        properties: {
+          query: {
+            type: "string",
+            minLength: 2,
+            maxLength: 500,
+          },
+        },
+
+        required: ["query"],
+
+        additionalProperties: false,
       },
-      required: ["query"],
-      additionalProperties: false
-    }
-  }
-}];
+    },
+  },
+];
+
+function searchFreshness(query) {
+  return /today|tonight|now|currently|current|latest|breaking|recent|this week|this month|live|right now|امروز|الان|فعلی|جدیدترین|آخرین|اخبار|لحظه/i.test(
+    query
+  )
+    ? "oneMonth"
+    : "noLimit";
+}
 
 async function searchWeb(query) {
-  if (!LANGSEARCH_KEY) throw new Error("LANGSEARCH_API_KEY not configured");
+  if (!LANGSEARCH_KEY) {
+    throw new Error(
+      "Web search is not configured"
+    );
+  }
+
+  const cleanQuery = String(
+    query || ""
+  )
+    .trim()
+    .slice(0, 500);
+
+  if (!cleanQuery) {
+    throw new Error(
+      "Empty search query"
+    );
+  }
 
   stats.searches++;
 
-  const r = await fetch("https://api.langsearch.com/v1/web-search", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${LANGSEARCH_KEY}`,
-    },
-    body: JSON.stringify({
-      query,
-      freshness: "noLimit",
-      summary: true,
-      count: 5,
-    }),
-  });
+  const response = await fetch(
+    LANGSEARCH_URL,
+    {
+      method: "POST",
 
-  if (!r.ok) throw new Error(`Search failed: ${r.status}`);
+      headers: {
+        "content-type":
+          "application/json",
+        authorization: `Bearer ${LANGSEARCH_KEY}`,
+      },
 
-  const d = await r.json();
-  const results = d?.data?.webPages?.value || [];
+      body: JSON.stringify({
+        query: cleanQuery,
+        freshness:
+          searchFreshness(
+            cleanQuery
+          ),
+        summary: true,
+        count: 5,
+      }),
 
-  return results.slice(0, 5).map((x, i) =>
-    `[${i + 1}] ${x.name || ""}\nURL: ${x.url || ""}\n${(x.summary || x.snippet || "").slice(0, 500)}`
-  ).join("\n\n");
+      signal:
+        AbortSignal.timeout(
+          FETCH_TIMEOUT_MS
+        ),
+    }
+  );
+
+  const raw = await response.text();
+  const data =
+    parseJsonSafely(raw);
+
+  if (!response.ok) {
+    throw new Error(
+      `Search failed (${response.status})`
+    );
+  }
+
+  const results =
+    data?.data?.webPages?.value;
+
+  if (
+    !Array.isArray(results) ||
+    !results.length
+  ) {
+    return "No useful web results were returned.";
+  }
+
+  return results
+    .slice(0, 5)
+    .map((item, index) => {
+      const title = String(
+        item?.name ||
+          "Untitled"
+      ).slice(0, 300);
+
+      const url = String(
+        item?.url || ""
+      ).slice(0, 1000);
+
+      const summary = String(
+        item?.summary ||
+          item?.snippet ||
+          ""
+      ).slice(0, 700);
+
+      const date = item?.datePublished
+        ? `\nPublished: ${String(
+            item.datePublished
+          ).slice(0, 80)}`
+        : "";
+
+      return [
+        `[${index + 1}] ${title}`,
+        `URL: ${url}${date}`,
+        summary,
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+function likelyNeedsSearch(prompt) {
+  const input = String(
+    prompt || ""
+  ).trim();
+
+  if (!input) {
+    return false;
+  }
+
+  return (
+    /\b(today|tonight|now|currently|current|latest|newest|recent|breaking|this week|this month|live|right now|as of)\b/i.test(
+      input
+    ) ||
+
+    /(امروز|امشب|الان|در حال حاضر|فعلی|جدیدترین|آخرین|اخبار|به.?روز|تا امروز|اکنون)/i.test(
+      input
+    ) ||
+
+    /\b(price|prices|exchange rate|weather|score|scores|schedule|standings|election|president|stock|crypto|bitcoin|flight|visa|opening hours|outage|version|release)\b/i.test(
+      input
+    )
+  );
+}
+
+function buildSearchInstruction(
+  query,
+  results
+) {
+  return [
+    "The user asked for information that should be verified with web search.",
+    `Search query: ${query}`,
+    "Use the following web results as evidence. Do not invent facts that are not supported by them.",
+    results,
+  ].join("\n\n");
 }
 
 // ============================================================
 // OPENROUTER
 // ============================================================
 
-async function orRequest(messages, model, stream = true, tools = null) {
-  if (!OR_KEY) throw new Error("OPENROUTER_API_KEY is missing");
+function selectedModel({
+  image,
+  file,
+  mode,
+}) {
+  if (image) {
+    return VISION_MODEL;
+  }
+
+  if (file) {
+    return FILE_MODEL;
+  }
+
+  if (mode === "fast") {
+    return FAST_MODEL;
+  }
+
+  if (mode === "deep") {
+    return DEEP_MODEL;
+  }
+
+  return TEXT_MODEL;
+}
+
+function cleanSystem(
+  userId,
+  mode,
+  hasSearchContext = false
+) {
+  const parts = [
+    SYSTEM_PROMPT,
+  ];
+
+  if (mode === "fast") {
+    parts.push(
+      "Prioritize speed and concise answers. Do not use web search unless the request clearly requires current verification."
+    );
+  }
+
+  if (mode === "deep") {
+    parts.push(
+      "Be thorough and careful. For current, recent, live, or uncertain externally verifiable claims, use web search when available."
+    );
+  }
+
+  if (hasSearchContext) {
+    parts.push(
+      "A web search was already performed. Treat its results as external evidence and clearly distinguish uncertainty."
+    );
+  }
+
+  parts.push(
+    "Never output hidden control tags such as <reaction> or <tool>. Answer normally for the user.",
+
+    "When web_search is available and the request needs current or externally verifiable information, actually call it rather than saying you cannot browse.",
+
+    "Do not call web_search for casual conversation, stable general knowledge, or purely creative tasks."
+  );
+
+  const style =
+    getPref(userId, "style");
+
+  const language =
+    getPref(userId, "language");
+
+  if (style) {
+    parts.push(
+      `Preferred style: ${style}.`
+    );
+  }
+
+  if (language) {
+    parts.push(
+      `Preferred language: ${language}.`
+    );
+  }
+
+  return parts.join(
+    "\n\n"
+  );
+}
+
+function makeUserMessage(
+  prompt,
+  image,
+  file
+) {
+  const text =
+    String(prompt || "").trim() ||
+    (
+      image
+        ? "Describe this image in detail."
+        : "Please analyze this file."
+    );
+
+  if (image) {
+    return {
+      role: "user",
+
+      content: [
+        {
+          type: "text",
+          text,
+        },
+
+        {
+          type: "image_url",
+
+          image_url: {
+            url: `data:${image.mime};base64,${image.base64}`,
+          },
+        },
+      ],
+    };
+  }
+
+  if (file) {
+    const fileName =
+      file.fileName ||
+      "uploaded-file";
+
+    const mime =
+      normalizeMime(file.mime);
+
+    if (
+      mime === "application/pdf" ||
+      isSupportedFileMime(mime)
+    ) {
+      return {
+        role: "user",
+
+        content: [
+          {
+            type: "text",
+            text,
+          },
+
+          {
+            type: "file",
+
+            file: {
+              filename: fileName,
+
+              file_data:
+                `data:${mime};base64,${file.base64}`,
+            },
+          },
+        ],
+      };
+    }
+  }
+
+  return {
+    role: "user",
+    content: text,
+  };
+}
+
+async function buildMessages({
+  userId,
+  prompt,
+  image,
+  file,
+  mode,
+  searchContext,
+}) {
+  const messages = [
+    {
+      role: "system",
+      content: cleanSystem(
+        userId,
+        mode,
+        Boolean(searchContext)
+      ),
+    },
+  ];
+
+  if (!image && !file) {
+    messages.push(
+      ...(await getHistory(userId))
+    );
+  }
+
+  if (searchContext) {
+    messages.push({
+      role: "system",
+      content: searchContext,
+    });
+  }
+
+  messages.push(
+    makeUserMessage(
+      prompt,
+      image,
+      file
+    )
+  );
+
+  return messages;
+}
+
+function orHeaders() {
+  return {
+    authorization:
+      `Bearer ${OR_KEY}`,
+
+    "content-type":
+      "application/json",
+
+    ...(process.env
+      .OPENROUTER_HTTP_REFERER
+      ? {
+          "HTTP-Referer":
+            process.env
+              .OPENROUTER_HTTP_REFERER,
+        }
+      : {}),
+
+    ...(process.env
+      .OPENROUTER_X_TITLE
+      ? {
+          "X-Title":
+            process.env
+              .OPENROUTER_X_TITLE,
+        }
+      : {}),
+  };
+}
+
+function redactErrorText(text) {
+  return String(text || "")
+    .replace(
+      /Bearer\s+[A-Za-z0-9._~-]+/gi,
+      "Bearer [redacted]"
+    )
+    .replace(
+      /(api[_-]?key|token|secret)["']?\s*[:=]\s*["']?[^\s,}"']+/gi,
+      "$1=[redacted]"
+    )
+    .slice(0, 1000);
+}
+
+class OpenRouterError extends Error {
+  constructor(
+    message,
+    status = 0,
+    body = ""
+  ) {
+    super(message);
+    this.name =
+      "OpenRouterError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+async function orRequest(
+  messages,
+  model,
+  stream = true,
+  tools = null
+) {
+  if (!OR_KEY) {
+    throw new OpenRouterError(
+      "OPENROUTER_API_KEY is missing",
+      0
+    );
+  }
+
+  if (!model) {
+    throw new OpenRouterError(
+      "No OpenRouter model is configured",
+      0
+    );
+  }
 
   const body = {
     model,
@@ -407,469 +1576,1353 @@ async function orRequest(messages, model, stream = true, tools = null) {
     stream,
   };
 
-  if (tools?.length) {
+  if (
+    Array.isArray(tools) &&
+    tools.length
+  ) {
     body.tools = tools;
     body.tool_choice = "auto";
   }
 
-  return fetch(OR, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${OR_KEY}`,
-      "content-type": "application/json",
-      ...(process.env.OPENROUTER_HTTP_REFERER
-        ? { "HTTP-Referer": process.env.OPENROUTER_HTTP_REFERER }
-        : {}),
-      ...(process.env.OPENROUTER_X_TITLE
-        ? { "X-Title": process.env.OPENROUTER_X_TITLE }
-        : {}),
-    },
-    body: JSON.stringify(body),
-  });
+  let lastError = null;
+
+  for (
+    let attempt = 0;
+    attempt <= 2;
+    attempt++
+  ) {
+    try {
+      const response =
+        await fetch(
+          OR_URL,
+          {
+            method: "POST",
+
+            headers: orHeaders(),
+
+            body: JSON.stringify(
+              body
+            ),
+
+            signal:
+              AbortSignal.timeout(
+                stream
+                  ? STREAM_FETCH_TIMEOUT_MS
+                  : FETCH_TIMEOUT_MS
+              ),
+          }
+        );
+
+      if (response.ok) {
+        return response;
+      }
+
+      const raw =
+        redactErrorText(
+          await response.text()
+        );
+
+      const retryAfter =
+        Number(
+          response.headers.get(
+            "retry-after"
+          ) || 0
+        );
+
+      const retryable =
+        response.status === 429 ||
+        response.status >= 500;
+
+      lastError =
+        new OpenRouterError(
+          `OpenRouter ${response.status}${
+            raw
+              ? `: ${raw}`
+              : ""
+          }`,
+          response.status,
+          raw
+        );
+
+      if (
+        !retryable ||
+        attempt >= 2
+      ) {
+        throw lastError;
+      }
+
+      await sleep(
+        retryAfter > 0
+          ? Math.min(
+              retryAfter * 1000,
+              10000
+            )
+          : Math.min(
+              700 * 2 ** attempt,
+              3000
+            )
+      );
+    } catch (error) {
+      if (
+        error instanceof
+        OpenRouterError
+      ) {
+        lastError = error;
+
+        if (
+          error.status === 429 ||
+          error.status >= 500
+        ) {
+          if (attempt < 2) {
+            await sleep(
+              Math.min(
+                700 * 2 ** attempt,
+                3000
+              )
+            );
+
+            continue;
+          }
+        }
+
+        throw error;
+      }
+
+      lastError =
+        new OpenRouterError(
+          error instanceof Error
+            ? error.message
+            : String(error)
+        );
+
+      if (attempt >= 2) {
+        throw lastError;
+      }
+
+      await sleep(
+        Math.min(
+          700 * 2 ** attempt,
+          3000
+        )
+      );
+    }
+  }
+
+  throw (
+    lastError ||
+    new OpenRouterError(
+      "OpenRouter request failed"
+    )
+  );
 }
 
-function cleanSystem(userId, mode) {
-  let extra = "";
+// ============================================================
+// STREAM PARSING / TOOL CALLS
+// ============================================================
 
-  if (mode === "fast") {
-    extra += "\nBe concise and prioritize speed.";
+async function* sseEvents(body) {
+  const reader =
+    body.getReader();
+
+  const decoder =
+    new TextDecoder();
+
+  let buffer = "";
+
+  try {
+    while (true) {
+      const {
+        value,
+        done,
+      } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      buffer +=
+        decoder.decode(
+          value,
+          {
+            stream: true,
+          }
+        );
+
+      const events =
+        buffer.split(
+          /\r?\n\r?\n/
+        );
+
+      buffer =
+        events.pop() || "";
+
+      for (const event of events) {
+        yield event;
+      }
+    }
+
+    buffer +=
+      decoder.decode();
+
+    if (buffer.trim()) {
+      yield buffer;
+    }
+  } finally {
+    reader.releaseLock?.();
   }
-
-  if (mode === "deep") {
-    extra += "\nBe thorough. Use web search when appropriate.";
-  }
-
-  const prefStyle = getPref(userId, "style");
-  const prefLang = getPref(userId, "language");
-
-  if (prefStyle) extra += `\nPreferred style: ${prefStyle}.`;
-  if (prefLang) extra += `\nPreferred language: ${prefLang}.`;
-
-  return SYSTEM_PROMPT + extra;
 }
 
-async function buildMessages(userId, prompt, image, mode) {
-  const messages = [{
-    role: "system",
-    content: cleanSystem(userId, mode),
-  }];
+function parseSSEEvent(
+  eventText
+) {
+  const dataLines =
+    String(eventText || "")
+      .split(/\r?\n/)
+      .filter(
+        (line) =>
+          line.startsWith("data:")
+      )
+      .map(
+        (line) =>
+          line
+            .slice(5)
+            .trim()
+      );
 
-  if (!image) {
-    const h = await getHistory(userId);
-    messages.push(...h.slice(-HISTORY_PAIRS * 2));
+  if (!dataLines.length) {
+    return null;
   }
 
-  if (image) {
-    messages.push({
-      role: "user",
-      content: [
-        { type: "text", text: prompt || "Describe this image in detail." },
-        {
-          type: "image_url",
-          image_url: {
-            url: `data:${image.mime};base64,${image.base64}`,
-          },
+  const payload =
+    dataLines.join("\n");
+
+  if (
+    !payload ||
+    payload === "[DONE]"
+  ) {
+    return {
+      done: true,
+    };
+  }
+
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+function mergeToolDeltas(
+  accumulator,
+  deltas
+) {
+  for (const delta of Array.isArray(
+    deltas
+  )
+    ? deltas
+    : []) {
+    const index =
+      Number.isInteger(delta?.index)
+        ? delta.index
+        : 0;
+
+    if (!accumulator[index]) {
+      accumulator[index] = {
+        id: "",
+        type: "function",
+
+        function: {
+          name: "",
+          arguments: "",
         },
-      ],
-    });
-  } else {
+      };
+    }
+
+    if (delta?.id) {
+      accumulator[index].id =
+        delta.id;
+    }
+
+    if (delta?.type) {
+      accumulator[index].type =
+        delta.type;
+    }
+
+    if (
+      delta?.function?.name
+    ) {
+      accumulator[index].function.name +=
+        delta.function.name;
+    }
+
+    if (
+      delta?.function?.arguments
+    ) {
+      accumulator[index].function.arguments +=
+        delta.function.arguments;
+    }
+  }
+}
+
+function normalizeToolCall(
+  tool
+) {
+  if (
+    !tool?.id ||
+    tool?.function?.name !==
+      "web_search"
+  ) {
+    return null;
+  }
+
+  let args;
+
+  try {
+    args = JSON.parse(
+      tool.function.arguments ||
+        "{}"
+    );
+  } catch {
+    return null;
+  }
+
+  const query =
+    typeof args?.query === "string"
+      ? args.query
+          .trim()
+          .slice(0, 500)
+      : "";
+
+  if (!query) {
+    return null;
+  }
+
+  return {
+    id: tool.id,
+
+    type: "function",
+
+    function: {
+      name: "web_search",
+
+      arguments: JSON.stringify({
+        query,
+      }),
+    },
+  };
+}
+
+async function streamModelResponse({
+  response,
+  onText,
+}) {
+  let full = "";
+  let firstTokenAt = null;
+  let toolCalls = [];
+
+  for await (
+    const eventText of sseEvents(
+      response.body
+    )
+  ) {
+    const chunk =
+      parseSSEEvent(
+        eventText
+      );
+
+    if (
+      !chunk ||
+      chunk.done
+    ) {
+      continue;
+    }
+
+    const choice =
+      chunk?.choices?.[0];
+
+    const delta =
+      choice?.delta;
+
+    if (delta?.tool_calls) {
+      mergeToolDeltas(
+        toolCalls,
+        delta.tool_calls
+      );
+    }
+
+    const piece =
+      typeof delta?.content ===
+      "string"
+        ? delta.content
+        : "";
+
+    if (piece) {
+      if (
+        firstTokenAt === null
+      ) {
+        firstTokenAt =
+          Date.now();
+      }
+
+      full += piece;
+
+      await onText(
+        piece,
+        full
+      );
+    }
+  }
+
+  return {
+    full,
+
+    firstTokenAt,
+
+    toolCalls:
+      toolCalls
+        .map(normalizeToolCall)
+        .filter(Boolean),
+  };
+}
+
+async function executeSearchCalls(
+  messages,
+  toolCalls,
+  searchCount,
+  assistantContent = null
+) {
+  const valid =
+    toolCalls.slice(
+      0,
+      Math.max(
+        0,
+        MAX_SEARCHES -
+          searchCount
+      )
+    );
+
+  if (!valid.length) {
+    return {
+      messages,
+      searchCount,
+      didSearch: false,
+    };
+  }
+
+  messages.push({
+    role: "assistant",
+    content:
+      assistantContent || null,
+    tool_calls: valid,
+  });
+
+  for (const call of valid) {
+    let query = "";
+
+    try {
+      query =
+        JSON.parse(
+          call.function.arguments ||
+            "{}"
+        ).query || "";
+    } catch {}
+
+    searchCount++;
+
+    let result =
+      "No search result available.";
+
+    if (query) {
+      try {
+        result =
+          await searchWeb(query);
+      } catch (error) {
+        result =
+          `Search failed: ${
+            error instanceof Error
+              ? error.message
+              : String(error)
+          }`;
+      }
+    }
+
     messages.push({
-      role: "user",
-      content: prompt,
+      role: "tool",
+      tool_call_id: call.id,
+      content: result,
     });
   }
 
-  return messages;
+  return {
+    messages,
+    searchCount,
+    didSearch: true,
+  };
 }
 
 // ============================================================
-// MODEL ROUTING
+// MODEL GENERATION / TELEGRAM STREAMING
 // ============================================================
 
-function chooseModel({ image, file, mode, prompt }) {
-  if (image) return VISION_MODEL;
-  if (file) return FILE_MODEL;
-  if (mode === "fast") return TEXT_MODEL;
-  if (mode === "deep") return TEXT_MODEL;
+async function sendChunked(
+  chatId,
+  text,
+  replyTo
+) {
+  const parts =
+    splitText(
+      text,
+      SAFE_STREAM_LIMIT
+    );
 
-  const s = String(prompt || "");
+  for (
+    let i = 0;
+    i < parts.length;
+    i++
+  ) {
+    const result =
+      await sendMessage(
+        chatId,
+        parts[i],
+        i === 0
+          ? replyTo
+          : undefined
+      );
 
-  if (/image|screenshot|photo|picture|عکس|تصویر/i.test(s)) return VISION_MODEL;
-  return TEXT_MODEL;
+    if (!result.ok) {
+      await sendPlain(
+        chatId,
+        parts[i],
+        i === 0
+          ? replyTo
+          : undefined
+      );
+    }
+
+    if (
+      i <
+      parts.length - 1
+    ) {
+      await sleep(50);
+    }
+  }
 }
 
-// ============================================================
-// STREAMING
-// ============================================================
+async function finalizeGroup(
+  chatId,
+  messageId,
+  text
+) {
+  const parts =
+    splitText(
+      text,
+      SAFE_STREAM_LIMIT
+    );
+
+  if (!parts.length) {
+    return false;
+  }
+
+  const first =
+    await editMessage(
+      chatId,
+      messageId,
+      parts[0]
+    );
+
+  if (!first.ok) {
+    await sendChunked(
+      chatId,
+      text
+    );
+
+    return false;
+  }
+
+  for (
+    let i = 1;
+    i < parts.length;
+    i++
+  ) {
+    await sendMessage(
+      chatId,
+      parts[i]
+    );
+
+    if (
+      i <
+      parts.length - 1
+    ) {
+      await sleep(50);
+    }
+  }
+
+  return true;
+}
+
+async function sendFinalPrivate(
+  chatId,
+  text,
+  replyTo
+) {
+  const parts =
+    splitText(
+      text,
+      SAFE_STREAM_LIMIT
+    );
+
+  for (
+    let i = 0;
+    i < parts.length;
+    i++
+  ) {
+    await sendMessage(
+      chatId,
+      parts[i],
+      i === 0
+        ? replyTo
+        : undefined
+    );
+
+    if (
+      i <
+      parts.length - 1
+    ) {
+      await sleep(50);
+    }
+  }
+}
+
+function splitText(
+  text,
+  limit = TG_LIMIT
+) {
+  const value =
+    String(text || "")
+      .replace(/\u0000/g, "")
+      .trim();
+
+  if (!value) {
+    return [];
+  }
+
+  if (
+    value.length <= limit
+  ) {
+    return [value];
+  }
+
+  const parts = [];
+  let start = 0;
+
+  while (
+    start < value.length
+  ) {
+    let end = Math.min(
+      start + limit,
+      value.length
+    );
+
+    if (
+      end < value.length
+    ) {
+      const windowStart =
+        start +
+        Math.floor(
+          limit * 0.45
+        );
+
+      const candidates = [
+        value.lastIndexOf(
+          "\n\n",
+          end
+        ),
+        value.lastIndexOf(
+          "\n",
+          end
+        ),
+        value.lastIndexOf(
+          ". ",
+          end
+        ),
+        value.lastIndexOf(
+          "! ",
+          end
+        ),
+        value.lastIndexOf(
+          "? ",
+          end
+        ),
+        value.lastIndexOf(
+          "؟ ",
+          end
+        ),
+        value.lastIndexOf(
+          " ",
+          end
+        ),
+      ];
+
+      const preferred =
+        candidates.find(
+          (position) =>
+            position >=
+            windowStart
+        );
+
+      if (
+        preferred != null &&
+        preferred > start
+      ) {
+        end =
+          preferred +
+          1;
+      }
+    }
+
+    let part =
+      value
+        .slice(start, end)
+        .trim();
+
+    if (!part) {
+      end = Math.min(
+        start + limit,
+        value.length
+      );
+
+      part =
+        value.slice(
+          start,
+          end
+        );
+    }
+
+    parts.push(part);
+    start = end;
+  }
+
+  return parts;
+}
 
 async function generate({
   chatId,
   userId,
   prompt,
   image,
-  fileText,
+  file,
   mode,
   replyTo,
   isPrivate,
 }) {
-  const started = Date.now();
+  const started =
+    Date.now();
+
   stats.requests++;
 
-  let streamMessage = null;
-  let full = "";
-  let firstToken = null;
-  let searches = 0;
-  let lastEdit = 0;
+  let streamMessageId =
+    null;
 
-  try {
-    const model = chooseModel({
+  const draftIdValue =
+    draftId();
+
+  let displayedLength = 0;
+
+  let lastTelegramUpdate =
+    0;
+
+  let full = "";
+
+  let firstTokenAt =
+    null;
+
+  let searchCount = 0;
+
+  let searchContext = "";
+
+  let toolsEnabled =
+    Boolean(
+      LANGSEARCH_KEY
+    ) &&
+    mode !== "fast";
+
+  const model =
+    selectedModel({
       image,
-      file: Boolean(fileText),
+      file: Boolean(file),
       mode,
-      prompt,
     });
 
-    const messages = await buildMessages(
-      userId,
-      fileText
-        ? `${prompt}\n\nFile contents:\n${fileText.slice(0, 50000)}`
-        : prompt,
-      image,
-      mode
-    );
+  console.log(
+    `[generate] chat=${String(
+      chatId
+    )} mode=${mode} model=${model} image=${Boolean(
+      image
+    )} file=${Boolean(file)}`
+  );
 
+  try {
     if (!isPrivate) {
-      streamMessage = await sendPlain(
-        chatId,
-        "🧠 Thinking…",
-        replyTo
-      );
-      if (!streamMessage?.result) {
-        throw new Error("Could not create streaming message");
+      const placeholder =
+        await sendPlain(
+          chatId,
+          "🧠 Thinking…",
+          replyTo
+        );
+
+      if (
+        placeholder.ok
+      ) {
+        streamMessageId =
+          placeholder
+            .result
+            ?.message_id ||
+          null;
       }
+    } else {
+      await sendPrivateDraft(
+        chatId,
+        draftIdValue,
+        "🧠 Thinking…"
+      ).catch(() => {});
     }
 
-    const timer = setInterval(() => {
-      typing(chatId).catch(() => {});
-    }, 5000);
+    const typeTimer =
+      setInterval(() => {
+        typing(chatId).catch(
+          () => {}
+        );
+      }, 5000);
+
+    typeTimer.unref?.();
 
     try {
-      for (let round = 0; round < 5; round++) {
-        full = "";
+      if (
+        likelyNeedsSearch(
+          prompt
+        ) &&
+        LANGSEARCH_KEY
+      ) {
+        try {
+          const result =
+            await searchWeb(
+              prompt
+            );
 
+          searchContext =
+            buildSearchInstruction(
+              prompt,
+              result
+            );
+
+          searchCount++;
+
+          console.log(
+            `[search] automatic search triggered chat=${String(
+              chatId
+            )} mode=${mode}`
+          );
+        } catch (error) {
+          searchCount++;
+
+          console.warn(
+            `[search] automatic search failed chat=${String(
+              chatId
+            )} reason=${
+              error instanceof Error
+                ? error.message
+                : String(error)
+            }`
+          );
+        }
+      }
+
+      const messages =
+        await buildMessages({
+          userId,
+          prompt,
+          image,
+          file,
+          mode,
+          searchContext,
+        });
+
+      for (
+        let round = 0;
+        round <
+        MAX_TOOL_ROUNDS;
+        round++
+      ) {
         const useTools =
-          searches < MAX_SEARCHES &&
-          mode !== "fast" &&
-          !fileText?.length > 45000;
+          toolsEnabled &&
+          searchCount <
+            MAX_SEARCHES;
 
-        const response = await orRequest(
-          messages,
-          model,
-          true,
-          useTools ? SEARCH_TOOL : null
-        );
+        let response;
 
-        if (!response.ok) {
-          const e = await response.text();
-          throw new Error(`OpenRouter ${response.status}: ${e}`);
-        }
+        try {
+          response =
+            await orRequest(
+              messages,
+              model,
+              true,
+              useTools
+                ? SEARCH_TOOL
+                : null
+            );
+        } catch (error) {
+          // Some models/providers reject tools.
+          // Retry the same model without tools.
+          if (
+            useTools &&
+            error instanceof
+              OpenRouterError &&
+            error.status === 400
+          ) {
+            console.warn(
+              `[openrouter] tool request rejected; retrying without tools model=${model}`
+            );
 
-        if (!response.body) throw new Error("Empty OpenRouter body");
+            toolsEnabled =
+              false;
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        const toolCalls = [];
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const raw of lines) {
-            const line = raw.trim();
-            if (!line.startsWith("data:")) continue;
-
-            const payload = line.slice(5).trim();
-            if (!payload || payload === "[DONE]") continue;
-
-            let chunk;
-            try { chunk = JSON.parse(payload); } catch { continue; }
-
-            const c = chunk?.choices?.[0];
-            const d = c?.delta;
-
-            if (d?.tool_calls) {
-              mergeTools(toolCalls, d.tool_calls);
-            }
-
-            const piece = typeof d?.content === "string" ? d.content : "";
-            if (!piece) continue;
-
-            if (firstToken === null) {
-              firstToken = Date.now() - started;
-              stats.firstTokenMs.push(firstToken);
-            }
-
-            full += piece;
-
-            if (isPrivate) {
-              // Rich draft if available; otherwise plain messages at end.
-              if (Date.now() - lastEdit > 900) {
-                lastEdit = Date.now();
-                await tg("sendRichMessageDraft", {
-                  chat_id: chatId,
-                  draft_id: draftId(),
-                  rich_message: { markdown: full },
-                }).catch(() => {});
-              }
-            } else if (streamMessage?.result?.message_id && Date.now() - lastEdit > 900) {
-              lastEdit = Date.now();
-              await editMessage(chatId, streamMessage.result.message_id, full.slice(0, TG_LIMIT));
-            }
+            response =
+              await orRequest(
+                messages,
+                model,
+                true,
+                null
+              );
+          } else {
+            throw error;
           }
         }
 
-        const validTools = toolCalls.filter(
-          x => x?.function?.name === "web_search" && x.id
-        );
+        if (
+          !response.body
+        ) {
+          throw new OpenRouterError(
+            "OpenRouter returned an empty stream",
+            response.status
+          );
+        }
 
-        if (validTools.length && useTools) {
-          const assistantToolCalls = validTools.map(x => ({
-            id: x.id,
-            type: "function",
-            function: {
-              name: "web_search",
-              arguments: x.function?.arguments || "{}",
-            },
-          }));
+        const streamed =
+          await streamModelResponse(
+            {
+              response,
 
-          const toolMessages = [];
+              onText: async (
+                _piece,
+                current
+              ) => {
+                if (
+                  firstTokenAt ===
+                  null
+                ) {
+                  firstTokenAt =
+                    Date.now();
 
-          for (const call of validTools) {
-            let q = "";
-            try {
-              q = JSON.parse(call.function.arguments || "{}")?.query || "";
-            } catch {}
+                  const firstTokenMs =
+                    firstTokenAt -
+                    started;
 
-            let result = "No search result.";
+                  recordMetric(
+                    stats.firstTokenMs,
+                    firstTokenMs
+                  );
 
-            if (q && searches < MAX_SEARCHES) {
-              searches++;
-              try {
-                result = await searchWeb(q);
-              } catch (e) {
-                result = `Search failed: ${e.message}`;
-              }
+                  console.log(
+                    `[latency] first-token=${firstTokenMs}ms model=${model}`
+                  );
+                }
+
+                full = current;
+
+                const now =
+                  Date.now();
+
+                if (
+                  now -
+                    lastTelegramUpdate <
+                  800
+                ) {
+                  return;
+                }
+
+                lastTelegramUpdate =
+                  now;
+
+                const streamText =
+                  current.slice(
+                    0,
+                    SAFE_STREAM_LIMIT
+                  );
+
+                if (
+                  streamText.length <=
+                    displayedLength &&
+                  current.length <
+                    SAFE_STREAM_LIMIT
+                ) {
+                  return;
+                }
+
+                displayedLength =
+                  current.length;
+
+                if (isPrivate) {
+                  await sendPrivateDraft(
+                    chatId,
+                    draftIdValue,
+                    streamText
+                  ).catch(() => {});
+                } else if (
+                  streamMessageId
+                ) {
+                  const edited =
+                    await editMessage(
+                      chatId,
+                      streamMessageId,
+                      streamText
+                    );
+
+                  if (
+                    !edited.ok
+                  ) {
+                    if (
+                      /message is not modified/i.test(
+                        edited.description ||
+                          ""
+                      )
+                    ) {
+                      return;
+                    }
+                  }
+                }
+              },
             }
+          );
 
-            toolMessages.push({
-              role: "tool",
-              tool_call_id: call.id,
-              content: result,
-            });
+        full =
+          streamed.full;
+
+        if (
+          firstTokenAt ===
+            null &&
+          streamed.firstTokenAt !==
+            null
+        ) {
+          firstTokenAt =
+            streamed.firstTokenAt;
+
+          recordMetric(
+            stats.firstTokenMs,
+            firstTokenAt -
+              started
+          );
+        }
+
+        if (
+          streamed
+            .toolCalls
+            .length &&
+          useTools
+        ) {
+          const result =
+            await executeSearchCalls(
+              messages,
+              streamed.toolCalls,
+              searchCount,
+              streamed.full
+            );
+
+          searchCount =
+            result.searchCount;
+
+          if (
+            result.didSearch
+          ) {
+            console.log(
+              `[search] tool search executed count=${searchCount} chat=${String(
+                chatId
+              )}`
+            );
+
+            continue;
           }
-
-          messages.push({
-            role: "assistant",
-            content: full,
-            tool_calls: assistantToolCalls,
-          });
-
-          messages.push(...toolMessages);
-          continue;
         }
 
         break;
       }
     } finally {
-      clearInterval(timer);
+      clearInterval(
+        typeTimer
+      );
     }
 
-    if (!full.trim()) throw new Error("Model returned no answer");
+    if (!full.trim()) {
+      throw new Error(
+        "The model returned no answer"
+      );
+    }
 
     if (isPrivate) {
-      await sendFinalPrivate(chatId, full, replyTo);
-    } else if (streamMessage?.result?.message_id) {
-      await finalizeGroup(chatId, streamMessage.result.message_id, full);
+      // sendMessageDraft is ephemeral.
+      // Persist the final answer normally.
+      await sendFinalPrivate(
+        chatId,
+        full,
+        replyTo
+      );
+    } else if (
+      streamMessageId
+    ) {
+      await finalizeGroup(
+        chatId,
+        streamMessageId,
+        full
+      );
     } else {
-      await sendChunked(chatId, full, replyTo);
+      await sendChunked(
+        chatId,
+        full,
+        replyTo
+      );
     }
 
-    stats.totalMs.push(Date.now() - started);
-    await saveHistory(userId, prompt, full);
+    recordMetric(
+      stats.totalMs,
+      Date.now() - started
+    );
+
+    await saveHistory(
+      userId,
+      prompt,
+      full
+    );
+
+    console.log(
+      `[complete] chat=${String(
+        chatId
+      )} elapsed=${
+        Date.now() - started
+      }ms searchCount=${searchCount}`
+    );
 
     return full;
-  } catch (e) {
+  } catch (error) {
     stats.errors++;
-    console.error("generate:", e);
 
-    const msg = `❌ **Error generating response**\n\n${e.message}`;
+    recordMetric(
+      stats.totalMs,
+      Date.now() - started
+    );
 
-    if (isPrivate) {
-      await sendChunked(chatId, msg, replyTo).catch(() => {});
-    } else if (streamMessage?.result?.message_id) {
-      await editMessage(chatId, streamMessage.result.message_id, msg).catch(() => {});
-    } else {
-      await sendMessage(chatId, msg, replyTo).catch(() => {});
-    }
-    throw e;
+    const safeMessage =
+      error instanceof Error
+        ? error.message
+        : String(error);
+
+    console.error(
+      `[generate] failed chat=${String(
+        chatId
+      )} model=${model} reason=${safeMessage}`
+    );
+
+    const userError =
+      "❌ *I couldn't complete that request.*\n\nPlease try again in a moment.";
+
+    try {
+      if (
+        !isPrivate &&
+        streamMessageId
+      ) {
+        await editMessage(
+          chatId,
+          streamMessageId,
+          userError
+        );
+      } else {
+        await sendMessage(
+          chatId,
+          userError,
+          isPrivate
+            ? replyTo
+            : undefined
+        );
+      }
+    } catch {}
+
+    throw error;
   }
-}
-
-// ============================================================
-// STREAM HELPERS
-// ============================================================
-
-function mergeTools(acc, deltas) {
-  for (const d of deltas) {
-    const i = typeof d.index === "number" ? d.index : 0;
-
-    if (!acc[i]) {
-      acc[i] = {
-        id: "",
-        type: "function",
-        function: { name: "", arguments: "" },
-      };
-    }
-
-    if (d.id) acc[i].id = d.id;
-    if (d.function?.name) acc[i].function.name += d.function.name;
-    if (d.function?.arguments) acc[i].function.arguments += d.function.arguments;
-  }
-}
-
-async function finalizeGroup(chatId, messageId, text) {
-  const parts = splitText(text, TG_LIMIT);
-
-  for (let i = 0; i < parts.length; i++) {
-    if (i === 0) {
-      await editMessage(chatId, messageId, parts[i]);
-    } else {
-      await sendPlain(chatId, parts[i]);
-    }
-  }
-}
-
-async function sendFinalPrivate(chatId, text, replyTo) {
-  const parts = splitText(text, RICH_LIMIT);
-
-  for (let i = 0; i < parts.length; i++) {
-    const r = await tg("sendRichMessage", {
-      chat_id: chatId,
-      rich_message: { markdown: parts[i] },
-      ...(i === 0 && replyTo
-        ? { reply_parameters: { message_id: replyTo } }
-        : {}),
-    });
-
-    if (!r.ok) {
-      await sendChunked(chatId, parts[i], i === 0 ? replyTo : undefined);
-    }
-  }
-}
-
-async function sendChunked(chatId, text, replyTo) {
-  for (const [i, part] of splitText(text, TG_LIMIT).entries()) {
-    await sendPlain(chatId, part, i === 0 ? replyTo : undefined);
-    await sleep(40);
-  }
-}
-
-function splitText(text, limit) {
-  const s = String(text || "");
-  if (s.length <= limit) return s ? [s] : [];
-
-  const out = [];
-  let i = 0;
-
-  while (i < s.length) {
-    let end = Math.min(i + limit, s.length);
-
-    if (end < s.length) {
-      const n = s.lastIndexOf("\n", end);
-      const sp = s.lastIndexOf(" ", end);
-      if (n > i + limit * 0.5) end = n + 1;
-      else if (sp > i + limit * 0.5) end = sp + 1;
-    }
-
-    const part = s.slice(i, end).trim();
-    if (part) out.push(part);
-    i = end;
-  }
-
-  return out;
 }
 
 // ============================================================
 // COMMANDS
 // ============================================================
 
-async function command(chatId, userId, text, messageId) {
-  const [cmd, ...rest] = text.trim().split(/\s+/);
-  const arg = rest.join(" ");
+function parseCommand(text) {
+  const input =
+    String(text || "").trim();
 
-  switch (cmd.toLowerCase()) {
-    case "/fast":
-      setPref(userId, "mode", "fast");
-      await sendMessage(chatId, "⚡ Fast mode enabled.", messageId);
-      return true;
+  if (
+    !input.startsWith("/")
+  ) {
+    return null;
+  }
 
-    case "/deep":
-      setPref(userId, "mode", "deep");
-      await sendMessage(chatId, "🧠 Deep mode enabled.", messageId);
-      return true;
+  const match =
+    input.match(
+      /^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/
+    );
 
-    case "/normal":
-      setPref(userId, "mode", "normal");
-      await sendMessage(chatId, "🙂 Normal mode enabled.", messageId);
-      return true;
+  if (!match) {
+    return null;
+  }
 
-    case "/style":
-      if (!arg) {
-        await sendMessage(chatId, "Usage: `/style concise`", messageId);
-      } else {
-        setPref(userId, "style", arg);
-        await sendMessage(chatId, `Style set to: *${esc(arg)}*`, messageId);
-      }
-      return true;
+  return {
+    name:
+      `/${match[1].toLowerCase()}`,
 
-    case "/language":
-      if (!arg) {
-        await sendMessage(chatId, "Usage: `/language English`", messageId);
-      } else {
-        setPref(userId, "language", arg);
-        await sendMessage(chatId, `Language set to: *${esc(arg)}*`, messageId);
-      }
-      return true;
+    username:
+      String(match[2] || ""),
 
-    case "/clear":
-    case "/clearmemory":
-      mem.delete(`history:${userId}`);
-      await sendMessage(chatId, "🧹 Memory cleared.", messageId);
-      return true;
+    arg:
+      String(match[3] || "").trim(),
+  };
+}
 
-    case "/status":
-      await sendMessage(chatId, statusText(), messageId);
-      return true;
+function commandTargetsThisBot(
+  parsed
+) {
+  if (!parsed?.username) {
+    return true;
+  }
 
-    case "/stats":
-      await sendMessage(chatId, statusText(), messageId);
-      return true;
+  const known =
+    botUsernameRuntime.toLowerCase();
 
-    case "/models":
+  return Boolean(
+    known &&
+      parsed.username.toLowerCase() ===
+        known
+  );
+}
+
+function inferModeFromPrompt(
+  prompt,
+  fallback
+) {
+  if (
+    /\bdeep\b/i.test(prompt)
+  ) {
+    return "deep";
+  }
+
+  if (
+    /\bfast\b/i.test(prompt)
+  ) {
+    return "fast";
+  }
+
+  return fallback;
+}
+
+function helpText() {
+  return [
+    "🤖 *How to use the bot*",
+    "",
+
+    "*💬 Chat*",
+
+    "Send a normal message in a private chat.",
+
+    "In groups, mention the bot, use the trigger command, or reply to the bot.",
+
+    "",
+
+    "*⚡ Modes*",
+
+    "`/fast` — prioritize speed and concise answers.",
+
+    "`/normal` — balanced default behavior.",
+
+    "`/deep` — more thorough reasoning and stronger web-search preference.",
+
+    "",
+
+    "*🧠 Memory*",
+
+    "Recent conversation history is kept in memory for follow-up questions.",
+
+    "`/clear` or `/clearmemory` — clear your conversation history.",
+
+    "History resets when the service restarts.",
+
+    "",
+
+    "*🌐 Web search*",
+
+    "The bot can search the web for current, recent, live, or changing information when search is available.",
+
+    "",
+
+    "*🖼 Images*",
+
+    "Send a JPEG, PNG, WEBP, or GIF with your question. Images are automatically routed to the vision model.",
+
+    "",
+
+    "*📄 Files*",
+
+    "Text/code files and PDFs can be analyzed when their format is supported. Files are routed to the file model.",
+
+    "",
+
+    "*⚙️ Preferences*",
+
+    "`/style <value>` — set a preferred answer style.",
+
+    "`/language <value>` — set a preferred response language.",
+
+    "",
+
+    "*📊 Info*",
+
+    "`/status` — basic bot status.",
+
+    "`/stats` — runtime statistics.",
+
+    "`/models` — configured model routes.",
+
+    "`/help` — show this guide.",
+  ].join("\n");
+}
+
+async function command(
+  chatId,
+  userId,
+  text,
+  messageId
+) {
+  const parsed =
+    parseCommand(text);
+
+  if (
+    !parsed ||
+    !commandTargetsThisBot(
+      parsed
+    )
+  ) {
+    return false;
+  }
+
+  switch (parsed.name) {
+    case "/start":
       await sendMessage(
         chatId,
-        [
-          "🤖 *Models*",
-          "",
-          `Text: \`${esc(TEXT_MODEL)}\``,
-          `Vision: \`${esc(VISION_MODEL)}\``,
-          `Files: \`${esc(FILE_MODEL)}\``,
-        ].join("\n"),
+        "👋 *Welcome.*\n\nSend me a message to chat, or use /help to see what I can do.",
         messageId
       );
       return true;
@@ -877,22 +2930,163 @@ async function command(chatId, userId, text, messageId) {
     case "/help":
       await sendMessage(
         chatId,
+        helpText(),
+        messageId
+      );
+      return true;
+
+    case "/fast":
+      setPref(
+        userId,
+        "mode",
+        "fast"
+      );
+
+      await sendMessage(
+        chatId,
+        "⚡ *Fast mode enabled.*",
+        messageId
+      );
+
+      return true;
+
+    case "/normal":
+      setPref(
+        userId,
+        "mode",
+        "normal"
+      );
+
+      await sendMessage(
+        chatId,
+        "🙂 *Normal mode enabled.*",
+        messageId
+      );
+
+      return true;
+
+    case "/deep":
+      setPref(
+        userId,
+        "mode",
+        "deep"
+      );
+
+      await sendMessage(
+        chatId,
+        "🧠 *Deep mode enabled.*",
+        messageId
+      );
+
+      return true;
+
+    case "/style":
+      if (!parsed.arg) {
+        await sendMessage(
+          chatId,
+          "Usage: `/style concise`",
+          messageId
+        );
+      } else {
+        setPref(
+          userId,
+          "style",
+          parsed.arg
+        );
+
+        await sendMessage(
+          chatId,
+          `Style set to *${esc(
+            parsed.arg
+          )}*.`,
+          messageId
+        );
+      }
+
+      return true;
+
+    case "/language":
+      if (!parsed.arg) {
+        await sendMessage(
+          chatId,
+          "Usage: `/language English`",
+          messageId
+        );
+      } else {
+        setPref(
+          userId,
+          "language",
+          parsed.arg
+        );
+
+        await sendMessage(
+          chatId,
+          `Language set to *${esc(
+            parsed.arg
+          )}*.`,
+          messageId
+        );
+      }
+
+      return true;
+
+    case "/clear":
+    case "/clearmemory":
+      mem.delete(
+        `history:${userId}`
+      );
+
+      await sendMessage(
+        chatId,
+        "🧹 *Memory cleared.*",
+        messageId
+      );
+
+      return true;
+
+    case "/status":
+      await sendMessage(
+        chatId,
+        statusText(false),
+        messageId
+      );
+
+      return true;
+
+    case "/stats":
+      await sendMessage(
+        chatId,
+        statusText(false),
+        messageId
+      );
+
+      return true;
+
+    case "/models":
+      await sendMessage(
+        chatId,
         [
-          "🤖 *Commands*",
+          "🤖 *Configured model routes*",
           "",
-          "/fast — faster responses",
-          "/normal — normal mode",
-          "/deep — deeper responses",
-          "/style concise",
-          "/language English",
-          "/clear — clear memory",
-          "/status — bot statistics",
-          "/models — active models",
-          "",
-          "Reply to a message with `/summarize`",
+          `Text: \`${esc(
+            TEXT_MODEL
+          )}\``,
+          `Fast: \`${esc(
+            FAST_MODEL
+          )}\``,
+          `Deep: \`${esc(
+            DEEP_MODEL
+          )}\``,
+          `Vision: \`${esc(
+            VISION_MODEL
+          )}\``,
+          `Files: \`${esc(
+            FILE_MODEL
+          )}\``,
         ].join("\n"),
         messageId
       );
+
       return true;
 
     default:
@@ -904,25 +3098,53 @@ async function command(chatId, userId, text, messageId) {
 // ADMIN COMMANDS
 // ============================================================
 
-const ADMIN_IDS = new Set(
-  String(process.env.ADMIN_IDS || "")
-    .split(",")
-    .map(x => x.trim())
-    .filter(Boolean)
-);
+async function adminCommand(
+  chatId,
+  userId,
+  text,
+  messageId
+) {
+  const parsed =
+    parseCommand(text);
 
-async function adminCommand(chatId, userId, text, messageId) {
-  if (!ADMIN_IDS.has(String(userId))) return false;
+  if (
+    !parsed ||
+    !commandTargetsThisBot(
+      parsed
+    )
+  ) {
+    return false;
+  }
 
-  switch (text.trim().split(/\s+/)[0].toLowerCase()) {
+  if (
+    !ADMIN_IDS.has(
+      String(userId)
+    )
+  ) {
+    return false;
+  }
+
+  switch (parsed.name) {
     case "/admin":
     case "/dev":
-      await sendMessage(chatId, statusText(), messageId);
+      await sendMessage(
+        chatId,
+        statusText(true),
+        messageId
+      );
+
       return true;
 
     case "/clearcache":
       mem.clear();
-      await sendMessage(chatId, "🧹 Cache cleared.", messageId);
+      lastReactions.clear();
+
+      await sendMessage(
+        chatId,
+        "🧹 *Runtime cache cleared.*",
+        messageId
+      );
+
       return true;
 
     default:
@@ -931,249 +3153,796 @@ async function adminCommand(chatId, userId, text, messageId) {
 }
 
 // ============================================================
-// PROCESS UPDATE
+// UPDATE PROCESSING
 // ============================================================
 
-async function processUpdate(update) {
-  const message = update?.message || update?.edited_message;
-  if (!message?.chat) return;
+function botMentioned(text) {
+  if (!botUsernameRuntime) {
+    return false;
+  }
 
-  const chatId = message.chat.id;
-  const userId = message.from?.id || chatId;
-  const messageId = message.message_id;
-  const text = message.text || "";
-  const caption = message.caption || "";
-  const photos = Array.isArray(message.photo) ? message.photo : [];
-  const isImage = photos.length > 0;
-  const isPrivate = message.chat.type === "private";
+  return new RegExp(
+    `@${escapeRegExp(
+      botUsernameRuntime
+    )}\\b`,
+    "i"
+  ).test(
+    String(text || "")
+  );
+}
 
-  // ----------------------------------------------------------
-  // Commands
-  // ----------------------------------------------------------
+function stripBotTargeting(text) {
+  let value =
+    String(text || "");
 
-  if (await adminCommand(chatId, userId, text, messageId)) return;
-  if (await command(chatId, userId, text, messageId)) return;
+  if (TRIGGER) {
+    value = value.replace(
+      new RegExp(
+        `^${escapeRegExp(
+          TRIGGER
+        )}(?:\\s+|$)`,
+        "i"
+      ),
+      ""
+    );
+  }
 
-  // ----------------------------------------------------------
-  // Targeting
-  // ----------------------------------------------------------
+  if (
+    botUsernameRuntime
+  ) {
+    value = value.replace(
+      new RegExp(
+        `@${escapeRegExp(
+          botUsernameRuntime
+        )}\\b`,
+        "ig"
+      ),
+      ""
+    );
+  }
+
+  return value.trim();
+}
+
+function replyIsFromBot(
+  message
+) {
+  const reply =
+    message?.reply_to_message;
+
+  const from =
+    reply?.from;
+
+  if (!from) {
+    return false;
+  }
+
+  if (
+    botId &&
+    from.id === botId
+  ) {
+    return true;
+  }
+
+  return Boolean(
+    botUsernameRuntime &&
+      String(
+        from.username || ""
+      ).toLowerCase() ===
+        botUsernameRuntime.toLowerCase()
+  );
+}
+
+async function processUpdate(
+  update
+) {
+  const message =
+    update?.message ||
+    update?.edited_message;
+
+  if (!message?.chat) {
+    return;
+  }
+
+  const chatId =
+    message.chat.id;
+
+  const userId =
+    message.from?.id ||
+    chatId;
+
+  const messageId =
+    message.message_id;
+
+  const text = String(
+    message.text || ""
+  );
+
+  const caption = String(
+    message.caption || ""
+  );
+
+  const photos =
+    Array.isArray(
+      message.photo
+    )
+      ? message.photo
+      : [];
+
+  const isImage =
+    photos.length > 0;
+
+  const isPrivate =
+    message.chat.type ===
+    "private";
+
+  const rawPrompt =
+    text || caption;
+
+  const parsedCommand =
+    parseCommand(text);
+
+  if (
+    parsedCommand &&
+    !commandTargetsThisBot(
+      parsedCommand
+    )
+  ) {
+    return;
+  }
+
+  if (
+    await adminCommand(
+      chatId,
+      userId,
+      text,
+      messageId
+    )
+  ) {
+    return;
+  }
+
+  if (
+    await command(
+      chatId,
+      userId,
+      text,
+      messageId
+    )
+  ) {
+    return;
+  }
 
   if (!isPrivate) {
     const mentioned =
-      BOT_USERNAME &&
-      new RegExp(`@${escapeRegExp(BOT_USERNAME)}`, "i").test(text);
-
-    const triggered =
-      text.toLowerCase() === TRIGGER.toLowerCase() ||
-      text.toLowerCase().startsWith(TRIGGER.toLowerCase() + " ");
-
-    const replied =
-      message.reply_to_message?.from?.is_bot &&
-      (
-        (botId && message.reply_to_message.from.id === botId) ||
-        (BOT_USERNAME &&
-          message.reply_to_message.from.username?.toLowerCase() ===
-            BOT_USERNAME.replace(/^@/, "").toLowerCase())
+      botMentioned(
+        rawPrompt
       );
 
-    if (!mentioned && !triggered && !replied && !isImage) return;
+    const triggered =
+      Boolean(
+        TRIGGER &&
+          (
+            rawPrompt.toLowerCase() ===
+              TRIGGER.toLowerCase() ||
+            rawPrompt
+              .toLowerCase()
+              .startsWith(
+                `${TRIGGER.toLowerCase()} `
+              )
+          )
+      );
+
+    const replied =
+      replyIsFromBot(
+        message
+      );
+
+    if (
+      !mentioned &&
+      !triggered &&
+      !replied &&
+      !isImage
+    ) {
+      return;
+    }
   }
 
-  let prompt = text || caption;
+  const prompt =
+    isPrivate
+      ? rawPrompt.trim()
+      : stripBotTargeting(
+          rawPrompt
+        );
 
-  if (!isPrivate) {
-    prompt = prompt
-      .replace(new RegExp(`@${escapeRegExp(BOT_USERNAME || "")}`, "ig"), "")
-      .replace(new RegExp(`^${escapeRegExp(TRIGGER)}\\s*`, "i"), "")
-      .trim();
+  const finalPrompt =
+    prompt ||
+    (
+      isImage
+        ? "Describe this image in detail."
+        : ""
+    );
+
+  if (
+    !finalPrompt &&
+    !isImage &&
+    !message.document
+  ) {
+    return;
   }
 
-  if (isImage && !prompt) {
-    prompt = "Describe this image in detail.";
-  }
+  // Local reaction only.
+  // It never calls OpenRouter.
+  const emoji =
+    chooseReaction(
+      finalPrompt ||
+        caption ||
+        text,
+      isImage,
+      chatId
+    );
 
-  // ----------------------------------------------------------
-  // Smart local reaction
-  // ----------------------------------------------------------
-
-  const rx = reaction(prompt || caption || text, isImage);
-
-  // Reaction immediately; never blocks AI generation.
-  reactMessage(chatId, messageId, rx).catch(() => {});
-
-  // ----------------------------------------------------------
-  // Attachments
-  // ----------------------------------------------------------
+  reactMessage(
+    chatId,
+    messageId,
+    emoji
+  ).catch(() => {});
 
   let image = null;
-  let fileText = "";
+  let file = null;
+
+  // ----------------------------------------------------------
+  // IMAGE
+  // ----------------------------------------------------------
 
   if (isImage) {
     stats.images++;
 
     try {
-      image = await telegramFile(photos[photos.length - 1].file_id);
-    } catch (e) {
-      await sendMessage(chatId, `❌ Image processing failed: ${e.message}`, messageId);
+      const selectedPhoto =
+        photos[
+          photos.length - 1
+        ];
+
+      image =
+        await telegramImage(
+          selectedPhoto.file_id
+        );
+    } catch (error) {
+      await sendMessage(
+        chatId,
+        `❌ ${esc(
+          error instanceof Error
+            ? error.message
+            : String(error)
+        )}`,
+        messageId
+      );
+
       return;
     }
   }
 
-  // Generic document support.
+  // ----------------------------------------------------------
+  // DOCUMENT / FILE
+  // ----------------------------------------------------------
+
   if (message.document) {
     stats.files++;
 
     try {
-      const f = await telegramFile(message.document.file_id);
-      fileText =
-        decodeTextFile(f.buffer, message.document.file_name || "") ||
-        "";
+      const downloaded =
+        await telegramFile(
+          message.document.file_id
+        );
 
-      if (!fileText) {
-        // For a PDF, extractable text isn't guaranteed through Telegram itself.
-        // Send model a note rather than pretending we extracted it.
-        fileText =
-          `File name: ${message.document.file_name || "unknown"}\n` +
-          `MIME type: ${message.document.mime_type || "unknown"}\n` +
-          "The file was downloaded successfully, but local text extraction is unavailable for this file type.";
+      const declaredMime =
+        normalizeMime(
+          message.document.mime_type
+        );
+
+      const mimeCandidates = [
+        downloaded.sniffedMime,
+        declaredMime,
+        downloaded.headerMime,
+        downloaded.extensionMime,
+      ].filter(Boolean);
+
+      const mime =
+        mimeCandidates.find(
+          (candidate) =>
+            isSupportedFileMime(
+              candidate
+            )
+        ) || "";
+
+      const fileName =
+        String(
+          message.document
+            .file_name ||
+            downloaded.path
+              .split("/")
+              .pop() ||
+            "uploaded-file"
+        );
+
+      const textContent =
+        decodeTextFile(
+          downloaded.buffer,
+          fileName
+        );
+
+      if (
+        !textContent &&
+        !isSupportedFileMime(
+          mime
+        )
+      ) {
+        await sendMessage(
+          chatId,
+          "❌ This file type is not supported. Supported files include PDFs and common text/code formats.",
+          messageId
+        );
+
+        return;
       }
-    } catch (e) {
-      await sendMessage(chatId, `❌ File processing failed: ${e.message}`, messageId);
+
+      file = {
+        ...downloaded,
+        fileName,
+        mime,
+        textContent:
+          textContent || "",
+      };
+    } catch (error) {
+      await sendMessage(
+        chatId,
+        `❌ ${esc(
+          error instanceof Error
+            ? error.message
+            : String(error)
+        )}`,
+        messageId
+      );
+
       return;
     }
   }
 
   // ----------------------------------------------------------
-  // Mode
+  // MODE
   // ----------------------------------------------------------
 
-  const mode =
-    getPref(userId, "mode") ||
-    (
-      /\bdeep\b/i.test(text) ? "deep" :
-      /\bfast\b/i.test(text) ? "fast" :
-      "normal"
+  let mode =
+    getPref(
+      userId,
+      "mode"
+    ) || "normal";
+
+  mode =
+    inferModeFromPrompt(
+      text,
+      mode
     );
+
+  if (
+    ![
+      "fast",
+      "normal",
+      "deep",
+    ].includes(mode)
+  ) {
+    mode = "normal";
+  }
 
   // ----------------------------------------------------------
   // AI
   // ----------------------------------------------------------
 
-  try {
-    await generate({
-      chatId,
-      userId,
-      prompt,
-      image,
-      fileText,
-      mode,
-      replyTo: messageId,
-      isPrivate,
-    });
-  } catch {}
+  const generationKey =
+    `${chatId}:${userId}`;
+
+  await runSerialized(
+    generationKey,
+    () =>
+      generate({
+        chatId,
+        userId,
+        prompt: finalPrompt,
+        image,
+        file,
+        mode,
+        replyTo: messageId,
+        isPrivate,
+      })
+  ).catch(() => {});
 }
 
 // ============================================================
 // UTILS
 // ============================================================
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
 function draftId() {
-  return Math.floor(Math.random() * 2147483000) + 1;
+  return (
+    Math.floor(
+      Math.random() *
+        2147483000
+    ) + 1
+  );
 }
 
-function esc(x) {
-  return String(x || "").replace(
-    /([_*\[\]()~`>#+\-=|{}.!\\])/g,
+function esc(value) {
+  return String(
+    value ?? ""
+  ).replace(
+    /([_\*\[\]\(\)~`>#+\-=|{}.!\\])/g,
     "\\$1"
   );
 }
 
-function escapeRegExp(x) {
-  return String(x || "").replace(
+function escapeRegExp(value) {
+  return String(
+    value || ""
+  ).replace(
     /[.*+?^${}()|[\]\\]/g,
     "\\$&"
   );
 }
 
 // ============================================================
-// STARTUP
+// STARTUP / WEBHOOK
 // ============================================================
 
-if (!BOT_TOKEN) console.error("Missing BOT_TOKEN");
-if (!OR_KEY) console.error("Missing OPENROUTER_API_KEY");
-if (!WEBHOOK_SECRET) console.error("Missing WEBHOOK_SECRET");
+if (!BOT_TOKEN) {
+  console.error(
+    "Missing BOT_TOKEN"
+  );
+}
+
+if (!OR_KEY) {
+  console.error(
+    "Missing OPENROUTER_API_KEY"
+  );
+}
+
+if (!WEBHOOK_SECRET) {
+  console.error(
+    "Missing WEBHOOK_SECRET"
+  );
+}
+
+if (!WEBHOOK_PATH_TOKEN) {
+  console.error(
+    "Missing WEBHOOK_PATH_TOKEN"
+  );
+}
+
+if (!LANGSEARCH_KEY) {
+  console.warn(
+    "LANGSEARCH_API_KEY is not configured; web search will be unavailable."
+  );
+}
 
 const app = express();
 
-app.use(express.json({ limit: "20mb" }));
+app.disable(
+  "x-powered-by"
+);
 
-app.get("/", (_, res) => {
-  res.status(200).send("AI Bot Running");
+app.use(
+  express.json({
+    limit: "2mb",
+    strict: true,
+  })
+);
+
+app.get("/", (_req, res) => {
+  res
+    .status(200)
+    .type("text/plain")
+    .send("AI Bot Running");
 });
 
-app.post(WEBHOOK_PATH, async (req, res) => {
-  const secret = req.get("X-Telegram-Bot-Api-Secret-Token");
-
-  if (!WEBHOOK_SECRET || secret !== WEBHOOK_SECRET) {
-    return res.status(401).send("Unauthorized");
+app.get(
+  "/health",
+  (_req, res) => {
+    res
+      .status(200)
+      .json({
+        ok: true,
+      });
   }
+);
 
-  res.status(200).send("OK");
+app.post(
+  WEBHOOK_PATH,
+  (req, res) => {
+    const secret =
+      req.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+      ) || "";
 
-  const updateId = req.body?.update_id;
-
-  if (updateId !== undefined) {
-    const key = `update:${updateId}`;
-    if (memGet(key)) return;
-    memSet(key, true, 300);
-  }
-
-  processUpdate(req.body).catch(e =>
-    console.error("processUpdate:", e)
-  );
-});
-
-app.post("/guest", async (req, res) => {
-  if (!GUEST_SECRET) return res.status(404).send("Not found");
-
-  if (req.get("X-Guest-Secret") !== GUEST_SECRET) {
-    return res.status(401).send("Unauthorized");
-  }
-
-  res.status(200).send("OK");
-
-  const g = req.body || {};
-  const chatId = g.chat_id || g.chatId;
-
-  if (!chatId) return;
-
-  try {
-    await generate({
-      chatId,
-      userId: `guest:${chatId}`,
-      prompt: g.prompt || g.text || "",
-      image: null,
-      fileText: "",
-      mode: "normal",
-      replyTo: undefined,
-      isPrivate: true,
-    });
-  } catch {}
-});
-
-app.listen(PORT, async () => {
-  console.log(`Server listening on ${PORT}`);
-  console.log(`Webhook: ${WEBHOOK_PATH}`);
-
-  try {
-    const r = await tg("getMe", {});
-    if (r.ok) {
-      botId = r.result.id;
-      console.log(`Bot: @${r.result.username}`);
+    if (
+      !WEBHOOK_SECRET ||
+      secret !==
+        WEBHOOK_SECRET
+    ) {
+      return res
+        .status(401)
+        .type("text/plain")
+        .send("Unauthorized");
     }
-  } catch {}
-});
+
+    const update =
+      req.body;
+
+    if (
+      !update ||
+      typeof update !==
+        "object"
+    ) {
+      return res
+        .status(400)
+        .send("Bad Request");
+    }
+
+    // Acknowledge Telegram immediately.
+    // Heavy work happens asynchronously.
+    res
+      .status(200)
+      .type("text/plain")
+      .send("OK");
+
+    const updateId =
+      update.update_id;
+
+    if (
+      updateId !==
+        undefined &&
+      updateId !== null
+    ) {
+      const key =
+        `update:${String(
+          updateId
+        )}`;
+
+      if (memGet(key)) {
+        return;
+      }
+
+      memSet(
+        key,
+        true,
+        UPDATE_TTL_SECONDS
+      );
+    }
+
+    setImmediate(() => {
+      processUpdate(update)
+        .catch((error) => {
+          stats.errors++;
+
+          console.error(
+            "processUpdate:",
+            error instanceof Error
+              ? error.message
+              : String(error)
+          );
+        });
+    });
+  }
+);
+
+app.post(
+  "/guest",
+  (req, res) => {
+    if (!GUEST_SECRET) {
+      return res
+        .status(404)
+        .type("text/plain")
+        .send("Not found");
+    }
+
+    const supplied =
+      req.get(
+        "X-Guest-Secret"
+      ) || "";
+
+    if (
+      supplied !==
+      GUEST_SECRET
+    ) {
+      return res
+        .status(401)
+        .type("text/plain")
+        .send("Unauthorized");
+    }
+
+    const body =
+      req.body || {};
+
+    const chatId =
+      body.chat_id ??
+      body.chatId;
+
+    const prompt =
+      String(
+        body.prompt ??
+          body.text ??
+          ""
+      ).trim();
+
+    if (
+      !chatId ||
+      !prompt
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "chat_id and prompt are required",
+        });
+    }
+
+    res
+      .status(202)
+      .json({
+        ok: true,
+      });
+
+    setImmediate(() => {
+      runSerialized(
+        `guest:${chatId}`,
+        () =>
+          generate({
+            chatId,
+            userId:
+              `guest:${chatId}`,
+            prompt,
+            image: null,
+            file: null,
+            mode: "normal",
+            replyTo:
+              undefined,
+            isPrivate: true,
+          })
+      ).catch(() => {});
+    });
+  }
+);
+
+app.use(
+  (
+    error,
+    _req,
+    res,
+    _next
+  ) => {
+    console.error(
+      "Express error:",
+      error instanceof Error
+        ? error.message
+        : String(error)
+    );
+
+    if (
+      res.headersSent
+    ) {
+      return;
+    }
+
+    res
+      .status(400)
+      .type("text/plain")
+      .send("Bad Request");
+  }
+);
+
+const server =
+  app.listen(
+    PORT,
+    async () => {
+      console.log(
+        `Server listening on ${PORT}`
+      );
+
+      console.log(
+        `Webhook path configured: ${
+          WEBHOOK_PATH_TOKEN
+            ? "yes"
+            : "no"
+        }`
+      );
+
+      if (!BOT_TOKEN) {
+        return;
+      }
+
+      try {
+        const result =
+          await tg(
+            "getMe",
+            {},
+            {
+              maxAttempts: 1,
+            }
+          );
+
+        if (result.ok) {
+          botId =
+            result.result.id;
+
+          botUsernameRuntime =
+            String(
+              result.result
+                .username ||
+                botUsernameRuntime ||
+                ""
+            ).replace(
+              /^@/,
+              ""
+            );
+
+          console.log(
+            `Bot identity loaded: ${
+              botUsernameRuntime
+                ? `@${botUsernameRuntime}`
+                : botId
+            }`
+          );
+        } else {
+          console.warn(
+            "Telegram getMe failed:",
+            result.description ||
+              "unknown error"
+          );
+        }
+      } catch (error) {
+        console.warn(
+          "Telegram startup check failed:",
+          error instanceof Error
+            ? error.message
+            : String(error)
+        );
+      }
+    }
+  );
+
+server.on(
+  "error",
+  (error) => {
+    console.error(
+      "Server error:",
+      error
+    );
+  }
+);
+
+process.on(
+  "unhandledRejection",
+  (reason) => {
+    stats.errors++;
+
+    console.error(
+      "Unhandled rejection:",
+      reason instanceof Error
+        ? reason.message
+        : String(reason)
+    );
+  }
+);
+
+process.on(
+  "uncaughtException",
+  (error) => {
+    stats.errors++;
+
+    console.error(
+      "Uncaught exception:",
+      error instanceof Error
+        ? error.message
+        : String(error)
+    );
+  }
+);
