@@ -167,7 +167,7 @@ function clearAllCache() {
 // Stats
 // ---------------------------------------------------------------------------
 
-const stats = { started: Date.now(), requests: 0, errors: 0, searches: 0, searchFailures: 0, images: 0, files: 0, telegramErrors: 0, openRouterErrors: 0, firstTokenMs: [], totalMs: [] };
+const stats = { started: Date.now(), requests: 0, errors: 0, searches: 0, searchFailures: 0, images: 0, files: 0, telegramErrors: 0, openRouterErrors: 0, firstTokenMs: [], totalMs: [], guestRequests: 0, guestErrors: 0 };
 function pushMetric(list, value) { if (!Number.isFinite(value)) return; list.push(Math.max(0, Math.round(value))); if (list.length > STATS_SAMPLE_LIMIT) list.shift(); }
 function avg(values) { return values.length ? Math.round(values.reduce((a, b) => a + b, 0) / values.length) : 0; }
 function formatUptime(seconds) {
@@ -177,7 +177,7 @@ function formatUptime(seconds) {
 function statusText(admin = false) {
   const uptime = Math.floor((Date.now() - stats.started) / 1000),
     lines = ["🤖 *Bot Status*", "", `Uptime: ${esc(formatUptime(uptime))}`, `Requests: ${stats.requests}`, `Errors: ${stats.errors}`, `Searches: ${stats.searches}`, `Images: ${stats.images}`, `Files: ${stats.files}`, `Avg first token: ${stats.firstTokenMs.length ? `${avg(stats.firstTokenMs)} ms` : "—"}`, `Avg total: ${stats.totalMs.length ? `${avg(stats.totalMs)} ms` : "—"}`];
-  if (admin) lines.push("", `Telegram errors: ${stats.telegramErrors}`, `OpenRouter errors: ${stats.openRouterErrors}`, `Search failures: ${stats.searchFailures}`, `Memory entries: ${memory.size}`, `In-flight queues: ${inFlightQueues.size}`);
+  if (admin) lines.push("", `Telegram errors: ${stats.telegramErrors}`, `OpenRouter errors: ${stats.openRouterErrors}`, `Search failures: ${stats.searchFailures}`, `Guest requests: ${stats.guestRequests}`, `Guest errors: ${stats.guestErrors}`, `Memory entries: ${memory.size}`, `In-flight queues: ${inFlightQueues.size}`);
   return lines.join("\n");
 }
 
@@ -892,6 +892,139 @@ function splitText(text, limit) {
 }
 
 // ---------------------------------------------------------------------------
+// Guest Calling Mode
+//
+// A guest update carries `guest_message` instead of a normal Telegram
+// `message`. It is handled on its own path — never routed through
+// handleUpdate()/generate() — but it reuses the exact same search-decision
+// and AI-generation building blocks (buildMessages, chooseModelChain,
+// orRequest, streamOpenRouter, performToolCalls) so behavior stays identical
+// to the normal bot. The final answer is delivered via answerGuestQuery()
+// instead of any Telegram send/edit call, and nothing here touches the
+// normal message flow, memory keying, or generate()'s streaming/UI logic.
+// ---------------------------------------------------------------------------
+
+// Runs the same search-decision + AI-generation pipeline used by normal
+// messages, non-streaming, and returns the final answer text. Guest queries
+// are one-shot (there is no stable per-user chat to keep memory for), so
+// conversation history is neither read nor written here — everything else
+// (model fallback chain, tool loop, search budget, time tool) is identical
+// to generate().
+async function generateGuestAnswer(guestUserId, prompt) {
+  const baseMessages = await buildMessages({ userId: guestUserId, prompt, image: null, file: null, fileText: "" });
+  const modelChain = chooseModelChain({ image: false, file: false });
+  const searchState = { count: 0 };
+  let full = "", finalModel = null;
+
+  for (let mi = 0; mi < modelChain.length; mi++) {
+    finalModel = modelChain[mi];
+    let messages = baseMessages.slice();
+    full = "";
+    searchState.count = 0;
+
+    try {
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        let roundText = "";
+        const toolCalls = [];
+        const searchAvailable = Boolean(LANGSEARCH_KEY && searchState.count < MAX_SEARCHES);
+        const toolsForRound = [...(searchAvailable ? SEARCH_TOOL : []), ...TIME_TOOL];
+
+        const response = await orRequest(messages, finalModel, toolsForRound);
+
+        await streamOpenRouter(response, piece => { roundText += piece; full += piece; }, calls => toolCalls.push(...calls), () => {});
+
+        const validTools = toolCalls.filter(validToolCall);
+        if (!validTools.length) break;
+
+        const { assistantToolCalls, toolMessages } = await performToolCalls(validTools, searchState);
+        messages.push({ role: "assistant", content: roundText || null, tool_calls: assistantToolCalls });
+        messages.push(...toolMessages);
+      }
+      break;
+    } catch (error) {
+      if (mi === modelChain.length - 1) throw error;
+      console.warn(`[guest:fallback] model=${sanitizeLog(finalModel)} failed (${sanitizeLog(error?.message || error)}), trying next model`);
+      continue;
+    }
+  }
+
+  if (!full.trim()) throw new Error("The model returned no visible answer.");
+  console.log(`[guest:complete] model=${sanitizeLog(finalModel)} chars=${full.length} searches=${searchState.count}`);
+  return full;
+}
+
+// Delivers the guest answer back to Telegram via answerGuestQuery — the
+// counterpart to sendMessage/editMessageRich for normal messages.
+async function answerGuestQuery(token, guestQueryId, replyText) {
+  try {
+    const res = await fetch(`${TG_API}/bot${token}/answerGuestQuery`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        guest_query_id: guestQueryId,
+        result: {
+          type: "article",
+          id: globalThis.crypto.randomUUID(),
+          title: "Reply",
+          input_message_content: { message_text: replyText }
+        }
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    });
+    const raw = await res.text();
+    let data;
+    try { data = raw ? JSON.parse(raw) : { ok: res.ok }; } catch { data = { ok: false, description: raw || res.statusText }; }
+    if (!data.ok) {
+      stats.telegramErrors++;
+      console.error(`answerGuestQuery error: ${sanitizeLog(JSON.stringify(data))}`);
+    }
+    return data;
+  } catch (e) {
+    stats.telegramErrors++;
+    console.error(`answerGuestQuery request failed: ${sanitizeLog(e?.message || e)}`);
+    return { ok: false, description: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// Entry point for an update carrying `guest_message`. Mirrors handleUpdate()
+// in shape (extract -> decide -> generate -> reply) but never touches the
+// normal message path, generate()'s Telegram streaming/UI, or saveHistory.
+async function handleGuestMessage(token, update) {
+  stats.guestRequests++;
+  const guestMessage = update.guest_message;
+  const guestQueryId = guestMessage?.guest_query_id;
+
+  if (!guestQueryId) {
+    console.error("guest_message missing guest_query_id");
+    return;
+  }
+
+  const text = String(guestMessage.text || guestMessage.caption || "").trim().slice(0, MAX_USER_PROMPT_CHARS);
+
+  if (!text) {
+    await answerGuestQuery(token, guestQueryId, "Mention me with a question and I'll do my best to help.");
+    return;
+  }
+
+  let replyText;
+  try {
+    const guestUserId = `guest:${guestQueryId}`;
+    const answer = await generateGuestAnswer(guestUserId, text);
+    replyText = String(answer || "").trim();
+    if (!replyText) throw new Error("Empty AI response");
+  } catch (error) {
+    stats.guestErrors++;
+    console.error(`[guest:generate:error] ${sanitizeLog(error?.message || error)}`);
+    replyText = "❌ Sorry, I couldn't generate a response right now.";
+  }
+
+  const MAX_LEN = 4096;
+  if (replyText.length > MAX_LEN) replyText = replyText.slice(0, MAX_LEN - 1) + "…";
+
+  await answerGuestQuery(token, guestQueryId, replyText);
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -1130,6 +1263,10 @@ function drainJobs() {
   }
 }
 function processUpdate(update) { return withGlobalConcurrency(() => handleUpdate(update)); }
+// Guest updates get their own concurrency-gated entry point, kept separate
+// from processUpdate()/handleUpdate() so guest traffic can never be routed
+// through the normal message path.
+function processGuestUpdate(update) { return withGlobalConcurrency(() => handleGuestMessage(BOT_TOKEN, update)); }
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -1197,6 +1334,14 @@ app.post(WEBHOOK_PATH, (req, res) => {
   }
 
   res.status(200).send("OK");
+
+  // Guest updates carry `guest_message` instead of a normal `message` and
+  // must never fall through to the normal message extraction below.
+  if (req.body?.guest_message) {
+    processGuestUpdate(req.body).catch(error => { console.error(`[processGuestUpdate:error] ${sanitizeLog(error?.message || error)}`); });
+    return;
+  }
+
   processUpdate(req.body).catch(error => { console.error(`[processUpdate:error] ${sanitizeLog(error?.message || error)}`); });
 });
 
