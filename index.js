@@ -398,11 +398,11 @@ function filePartFromDownload(file, fileName, declaredMime) {
 }
 
 // ---------------------------------------------------------------------------
-// Tools: web search + time-via-search
+// Tools: web search + time
 // ---------------------------------------------------------------------------
 
 const SEARCH_TOOL = [{ type: "function", function: { name: "web_search", description: "Search the web for current, recent, live, or externally verifiable information. Use it when facts may have changed or need verification.", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, maxLength: 500 } }, required: ["query"], additionalProperties: false } } }];
-const TIME_TOOL = [{ type: "function", function: { name: "get_time", description: "Get the current date and time for a place or timezone. This runs a web search query for it (it is a query against the web search service, not a dedicated time API), so use it whenever the user asks 'what time is it', 'what's today's date', or similar.", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, maxLength: 200, description: "A city, region, country, or timezone name, e.g. 'Tokyo', 'UTC', 'New York'." } }, required: ["query"], additionalProperties: false } } }];
+const TIME_TOOL = [{ type: "function", function: { name: "get_time", description: "Get the current date and time for any place in the world via a dedicated time API. Use it whenever the user asks 'what time is it', 'what's today's date', or similar. Resolve the user's location to the correct IANA time zone identifier before calling (e.g. 'Asia/Tehran', 'Europe/London', 'America/New_York', 'UTC').", parameters: { type: "object", properties: { timezone: { type: "string", minLength: 1, maxLength: 100, description: "IANA time zone identifier for the place the user is asking about, e.g. 'Asia/Tehran', 'Europe/London', 'America/New_York'." } }, required: ["timezone"], additionalProperties: false } } }];
 const TOOL_NAMES = new Set(["web_search", "get_time"]);
 
 async function searchWeb(query) {
@@ -422,12 +422,30 @@ async function searchWeb(query) {
   }).join("\n\n");
 }
 
-// The time tool intentionally has no dedicated time API behind it — it is a
-// web_search call in disguise, per spec.
-async function getTime(query) {
-  const clean = String(query || "").trim().slice(0, 200);
-  if (!clean) throw new Error("No location was supplied.");
-  return searchWeb(`current date and time in ${clean}`);
+// Dedicated time lookup via timeapi.io — no web search involved.
+async function get_time(timezone = "Asia/Tehran") {
+  try {
+    const url =
+      `https://timeapi.io/api/Time/current/zone?timeZone=${encodeURIComponent(timezone)}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(
+        `TimeAPI request failed: ${response.status}`
+      );
+    }
+    const data = await response.json();
+    return {
+      timezone: data.timeZone,
+      date: data.date,
+      time: data.time,
+      dateTime: data.dateTime,
+      dayOfWeek: data.dayOfWeek,
+      dstActive: data.dstActive
+    };
+  } catch (error) {
+    console.error("get_time error:", error);
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -513,8 +531,8 @@ function cleanSystem() {
   const extra = [];
   if (LANGSEARCH_KEY) {
     extra.push("Use the web_search tool whenever information is current, recent, live, unstable, niche, or externally verifiable. Prefer searching over saying you do not know when external verification could answer the question. Do not search unnecessarily.");
-    extra.push("Use the get_time tool whenever the user asks for the current date, current time, or 'what time is it' for a place or timezone. Never guess or state a time from memory.");
   }
+  extra.push("Use the get_time tool whenever the user asks for the current date, current time, or 'what time is it' for a place or timezone. Never guess or state a time from memory.");
   extra.push("Reply in the same language the user is writing in. Do not ask the user which language or style to use — infer it from their message.");
   extra.push("Never expose internal tool calls, hidden reasoning, API keys, secrets, or implementation details.");
   extra.push("Return a normal user-facing answer. Do not use hidden XML-style reaction tags or metadata markers.");
@@ -542,7 +560,7 @@ async function buildMessages({ userId, prompt, image, file, fileText }) {
 // Streaming
 // ---------------------------------------------------------------------------
 
-async function streamOpenRouter(response, onPiece, onToolCalls) {
+async function streamOpenRouter(response, onPiece, onToolCalls, onReasoning) {
   const reader = response.body.getReader(), decoder = new TextDecoder();
   let pending = "";
   const toolCalls = [];
@@ -552,13 +570,13 @@ async function streamOpenRouter(response, onPiece, onToolCalls) {
     pending += decoder.decode(value, { stream: true });
     const lines = pending.split(/\r?\n/);
     pending = lines.pop() || "";
-    for (const rawLine of lines) processSseLine(rawLine, onPiece, toolCalls);
+    for (const rawLine of lines) processSseLine(rawLine, onPiece, toolCalls, onReasoning);
   }
   pending += decoder.decode();
-  if (pending) for (const rawLine of pending.split(/\r?\n/)) processSseLine(rawLine, onPiece, toolCalls);
+  if (pending) for (const rawLine of pending.split(/\r?\n/)) processSseLine(rawLine, onPiece, toolCalls, onReasoning);
   if (typeof onToolCalls === "function") onToolCalls(toolCalls.filter(validToolCall));
 }
-function processSseLine(rawLine, onPiece, toolCalls) {
+function processSseLine(rawLine, onPiece, toolCalls, onReasoning) {
   const line = rawLine.trim();
   if (!line.startsWith("data:")) return;
   const payload = line.slice(5).trim();
@@ -567,8 +585,14 @@ function processSseLine(rawLine, onPiece, toolCalls) {
   try { chunk = JSON.parse(payload); } catch { return; }
   const delta = chunk?.choices?.[0]?.delta;
   if (Array.isArray(delta?.tool_calls)) mergeTools(toolCalls, delta.tool_calls);
-  const piece = typeof delta?.content === "string" ? delta.content : "";
-  if (piece && typeof onPiece === "function") onPiece(piece);
+  // Reasoning content (when a model emits it) is captured internally only —
+  // it must never be shown to the user, including inside <tg-thinking>.
+  const reasoningChunk = typeof delta?.reasoning_content === "string"
+    ? delta.reasoning_content
+    : (typeof delta?.reasoning === "string" ? delta.reasoning : "");
+  if (reasoningChunk && typeof onReasoning === "function") onReasoning(reasoningChunk);
+  const contentChunk = typeof delta?.content === "string" ? delta.content : "";
+  if (contentChunk && typeof onPiece === "function") onPiece(contentChunk);
 }
 function mergeTools(acc, deltas) {
   for (const delta of deltas) {
@@ -580,7 +604,8 @@ function mergeTools(acc, deltas) {
   }
 }
 function validToolCall(call) { return Boolean(call?.id && call?.type === "function" && TOOL_NAMES.has(call?.function?.name)); }
-function parseToolQuery(call, maxLen = 500) { try { const parsed = JSON.parse(call?.function?.arguments || "{}"); return String(parsed?.query || "").trim().slice(0, maxLen); } catch { return ""; } }
+function parseToolArg(call, field, maxLen = 500) { try { const parsed = JSON.parse(call?.function?.arguments || "{}"); return String(parsed?.[field] || "").trim().slice(0, maxLen); } catch { return ""; } }
+function parseToolQuery(call, maxLen = 500) { return parseToolArg(call, "query", maxLen); }
 
 async function performToolCalls(toolCalls, searchState) {
   const assistantToolCalls = toolCalls.map(call => ({ id: call.id, type: "function", function: { name: call.function?.name || "web_search", arguments: call.function?.arguments || "{}" } })),
@@ -589,10 +614,11 @@ async function performToolCalls(toolCalls, searchState) {
     const name = call.function?.name;
     let result = "No result.";
     if (name === "get_time") {
-      const query = parseToolQuery(call, 200);
-      if (!query) result = "The time request was invalid because no location was supplied.";
-      else if (searchState.count >= MAX_SEARCHES) result = "Search limit reached for this request. Continue using the information already gathered.";
-      else { searchState.count++; try { result = await getTime(query); } catch (error) { result = `Time lookup failed gracefully: ${error instanceof Error ? error.message : "unknown error"}`; } }
+      const timezone = parseToolArg(call, "timezone", 100) || "Asia/Tehran";
+      const timeInfo = await get_time(timezone);
+      result = timeInfo
+        ? [`Time zone: ${timeInfo.timezone}`, `Date: ${timeInfo.date}`, `Time: ${timeInfo.time}`, `Day of week: ${timeInfo.dayOfWeek}`, `DST active: ${timeInfo.dstActive}`].join("\n")
+        : `Time lookup failed for time zone "${timezone}". Ask the user to confirm the city or time zone.`;
     } else {
       const query = parseToolQuery(call, 500);
       if (!query) result = "The search request was invalid because no query was supplied.";
@@ -605,7 +631,10 @@ async function performToolCalls(toolCalls, searchState) {
 }
 
 function escHtml(value) { return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-function thinkingHtml(stage = "Thinking…") { return `<b>${escHtml(stage)}</b>`; }
+// Native Telegram "thinking" indicator (Bot API 10.1, <tg-thinking>). This is
+// only ever a short user-facing status label — never the model's actual
+// reasoning_content (see performToolCalls / streamOpenRouter above).
+function thinkingHtml(stage = "Thinking...") { return `<tg-thinking>${escHtml(stage)}</tg-thinking>`; }
 
 // ---------------------------------------------------------------------------
 // Generation pipeline
@@ -614,8 +643,10 @@ function thinkingHtml(stage = "Thinking…") { return `<b>${escHtml(stage)}</b>`
 async function generate({ chatId, userId, prompt, image, file, fileText, replyTo, messageId, isPrivate }) {
   const started = Date.now();
   stats.requests++;
-  let full = "", firstTokenRecorded = false, finalModel = null, streamMessageId = null, lastEdit = 0;
-  const draftIdValue = randomDraftId();
+  let full = "", fullReasoning = "", firstTokenRecorded = false, finalModel = null, streamMessageId = null, lastEdit = 0;
+  // One persistent draft id for the entire generation (thinking -> searching
+  // -> thinking -> streaming). Never re-created between states.
+  const draftIdValue = createRichDraftId();
   let groupEditChain = Promise.resolve(), draftChain = Promise.resolve(), typingTimer = null, draftFallbackMessageId = null, useRichDraft = isPrivate;
   let statusTimer = null, statusVersion = 0, generationStarted = false;
 
@@ -651,20 +682,20 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
     console.log(`[request] models=${sanitizeLog(modelChain.join(" -> "))} image=${Boolean(image)} file=${Boolean(file)}`);
 
     if (!isPrivate) {
-      const placeholder = await sendRichMessage(chatId, thinkingHtml("🧠 Thinking…"), replyTo);
+      const placeholder = await sendRichMessage(chatId, thinkingHtml("🧠 Thinking..."), replyTo);
       if (!placeholder?.ok || !placeholder?.result?.message_id) throw new Error("Could not create the Telegram streaming message.");
       streamMessageId = placeholder.result.message_id;
     } else {
       draftChain = draftChain.then(async () => {
-        const result = await sendRichMessageDraftHtml(chatId, draftIdValue, thinkingHtml("🧠 Thinking…"));
+        const result = await sendRichMessageDraftHtml(chatId, draftIdValue, thinkingHtml("🧠 Thinking..."));
         if (result.ok) return;
         useRichDraft = false;
-        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("🧠 Thinking…"), replyTo);
+        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("🧠 Thinking..."), replyTo);
         if (fallback?.ok) draftFallbackMessageId = fallback.result?.message_id || null;
       });
     }
 
-    setStatus(thinkingHtml("🧠 Thinking…"));
+    setStatus(thinkingHtml("🧠 Thinking..."));
     typingTimer = setInterval(() => typing(chatId).catch(() => {}), TYPING_MS);
     typingTimer.unref?.();
 
@@ -675,6 +706,7 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
       finalModel = modelChain[mi];
       messages = baseMessages.slice();
       full = "";
+      fullReasoning = "";
       firstTokenRecorded = false;
       searchState.count = 0;
 
@@ -682,9 +714,13 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
         for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
           let roundText = "";
           const toolCalls = [];
-          const allowTools = Boolean(LANGSEARCH_KEY && searchState.count < MAX_SEARCHES);
+          // get_time is always offered (it no longer depends on the search
+          // provider); web_search is offered only while search is configured
+          // and the per-request search budget remains.
+          const searchAvailable = Boolean(LANGSEARCH_KEY && searchState.count < MAX_SEARCHES);
+          const toolsForRound = [...(searchAvailable ? SEARCH_TOOL : []), ...TIME_TOOL];
 
-          const response = await orRequest(messages, finalModel, allowTools ? [...SEARCH_TOOL, ...TIME_TOOL] : null);
+          const response = await orRequest(messages, finalModel, toolsForRound);
 
           await streamOpenRouter(response, piece => {
             if (!firstTokenRecorded) {
@@ -707,7 +743,7 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
                     if (!richResult.ok) {
                       useRichDraft = false;
                       if (!draftFallbackMessageId) {
-                        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("🧠 Thinking…"), replyTo);
+                        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("🧠 Thinking..."), replyTo);
                         if (fallback?.ok) draftFallbackMessageId = fallback.result?.message_id || null;
                       }
                     }
@@ -721,25 +757,28 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
               const preview = full.slice(0, RICH_LIMIT);
               groupEditChain = groupEditChain.then(async () => { await editMessageRich(chatId, streamMessageId, preview).catch(() => {}); }).catch(() => {});
             }
-          }, calls => toolCalls.push(...calls));
+          }, calls => toolCalls.push(...calls), reasoningPiece => { fullReasoning += reasoningPiece; });
 
           const validTools = toolCalls.filter(validToolCall);
-          if (!validTools.length || !allowTools) break;
+          if (!validTools.length) break;
 
           if (!generationStarted) {
             const hasSearch = validTools.some(call => call?.function?.name === "web_search");
             const hasTime = validTools.some(call => call?.function?.name === "get_time");
             stopStatus();
-            if (hasSearch && hasTime) setStatus(thinkingHtml("🔎🕐 Searching the web and checking the time…"));
-            else if (hasTime) setStatus(thinkingHtml("🕐 Checking the current time…"));
-            else setStatus(thinkingHtml("🔎 Searching the web…"));
+            if (hasSearch) setStatus(thinkingHtml("🔎 Searching the web..."));
+            else if (hasTime) setStatus(thinkingHtml("🕐 Checking the current time..."));
+            else setStatus(thinkingHtml("🧠 Thinking..."));
           }
 
           const { assistantToolCalls, toolMessages } = await performToolCalls(validTools, searchState);
           messages.push({ role: "assistant", content: roundText || null, tool_calls: assistantToolCalls });
           messages.push(...toolMessages);
 
-          if (!generationStarted) { stopStatus(); setStatus(thinkingHtml("🧠 Working through the results…")); }
+          // Back to a plain "Thinking..." state between tool results and the
+          // next model round, matching the required thinking -> searching ->
+          // thinking -> streaming sequence.
+          if (!generationStarted) { stopStatus(); setStatus(thinkingHtml("🧠 Thinking...")); }
         }
         break;
       } catch (error) {
@@ -930,7 +969,7 @@ function helpText() {
     "",
     "🌐 *Web & time*",
     "• I automatically search the web when a question needs current, recent, or external information.",
-    "• I can look up the current date and time for a place using the web search service.",
+    "• I can look up the current date and time for any place using a dedicated time API.",
     "",
     "🖼 *Input*",
     "• Type a prompt or send a JPEG, PNG, or WEBP image.",
@@ -1097,7 +1136,15 @@ function processUpdate(update) { return withGlobalConcurrency(() => handleUpdate
 // ---------------------------------------------------------------------------
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function randomDraftId() { return Math.max(1, Math.floor(Math.random() * 0x7fffffff)); }
+// One draft id per generation, per the Rich Message Draft API contract
+// (draft_id must be non-zero; the same id animates in place across updates).
+function createRichDraftId() {
+  return (
+    globalThis.crypto.getRandomValues(
+      new Uint32Array(1)
+    )[0] || 1
+  );
+}
 function esc(value) { return String(value ?? "").replace(/[_*\[\]()~`>#+\-=|{}.!\\]/g, "\\$&"); }
 function escCode(value) { return String(value ?? "").replace(/[`\\]/g, "\\$&"); }
 function escapeRegExp(value) { return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
@@ -1187,7 +1234,3 @@ const server = app.listen(PORT, async () => {
   }
   fetchModelCatalog(false).catch(() => {});
 });
-
-server.on("error", error => { console.error(`HTTP server error: ${sanitizeLog(error?.message || error)}`); });
-process.on("unhandledRejection", reason => { console.error(`[unhandledRejection] ${sanitizeLog(reason?.message || reason)}`); });
-process.on("uncaughtException", error => { console.error(`[uncaughtException] ${sanitizeLog(error?.message || error)}`); });
