@@ -635,6 +635,18 @@ function escHtml(value) { return String(value ?? "").replace(/&/g, "&amp;").repl
 // only ever a short user-facing status label — never the model's actual
 // reasoning_content (see performToolCalls / streamOpenRouter above).
 function thinkingHtml(stage = "Thinking...") { return `<tg-thinking>${escHtml(stage)}</tg-thinking>`; }
+// mm:ss-style elapsed label for the live timer line under the status.
+function formatElapsed(seconds) {
+  const total = Math.max(0, Math.floor(seconds)), m = Math.floor(total / 60), s = total % 60;
+  return m > 0 ? `⏱ ${m}m ${s}s` : `⏱ ${s}s`;
+}
+// Stage label (Thinking / Searching the web / Checking the current time)
+// plus a live elapsed-time counter one line below it — both rendered inside
+// their own <tg-thinking> tag so the timer gets the same shimmer effect as
+// the stage label itself.
+function statusWithTimerHtml(stage, elapsedSeconds) {
+  return `${thinkingHtml(stage)}\n${thinkingHtml(formatElapsed(elapsedSeconds))}`;
+}
 
 // ---------------------------------------------------------------------------
 // Generation pipeline
@@ -650,11 +662,12 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
   let groupEditChain = Promise.resolve(), draftChain = Promise.resolve(), typingTimer = null, draftFallbackMessageId = null, useRichDraft = isPrivate;
   let statusTimer = null, statusVersion = 0, generationStarted = false;
 
-  const setStatus = html => {
+  const setStatus = stageLabel => {
     const version = ++statusVersion;
     if (statusTimer) clearInterval(statusTimer);
     const tick = () => {
       if (generationStarted || version !== statusVersion) return;
+      const html = statusWithTimerHtml(stageLabel, (Date.now() - started) / 1000);
       if (isPrivate) {
         draftChain = draftChain.then(async () => {
           if (generationStarted || version !== statusVersion) return;
@@ -669,7 +682,7 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
       }
     };
     tick();
-    statusTimer = setInterval(tick, 800);
+    statusTimer = setInterval(tick, 1000);
     statusTimer.unref?.();
   };
   const stopStatus = () => { statusVersion++; if (statusTimer) clearInterval(statusTimer); statusTimer = null; };
@@ -695,7 +708,7 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
       });
     }
 
-    setStatus(thinkingHtml("🧠 Thinking..."));
+    setStatus("🧠 Thinking...");
     typingTimer = setInterval(() => typing(chatId).catch(() => {}), TYPING_MS);
     typingTimer.unref?.();
 
@@ -766,9 +779,9 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
             const hasSearch = validTools.some(call => call?.function?.name === "web_search");
             const hasTime = validTools.some(call => call?.function?.name === "get_time");
             stopStatus();
-            if (hasSearch) setStatus(thinkingHtml("🔎 Searching the web..."));
-            else if (hasTime) setStatus(thinkingHtml("🕐 Checking the current time..."));
-            else setStatus(thinkingHtml("🧠 Thinking..."));
+            if (hasSearch) setStatus("🔎 Searching the web...");
+            else if (hasTime) setStatus("🕐 Checking the current time...");
+            else setStatus("🧠 Thinking...");
           }
 
           const { assistantToolCalls, toolMessages } = await performToolCalls(validTools, searchState);
@@ -778,7 +791,7 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
           // Back to a plain "Thinking..." state between tool results and the
           // next model round, matching the required thinking -> searching ->
           // thinking -> streaming sequence.
-          if (!generationStarted) { stopStatus(); setStatus(thinkingHtml("🧠 Thinking...")); }
+          if (!generationStarted) { stopStatus(); setStatus("🧠 Thinking..."); }
         }
         break;
       } catch (error) {
