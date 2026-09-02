@@ -1,4 +1,4 @@
-import express from "express";const TG_API="https://api.telegram.org",OR_API="https://openrouter.ai/api/v1/chat/completions",OR_MODELS_API="https://openrouter.ai/api/v1/models",LANGSEARCH_API="https://api.langsearch.com/v1/web-search";const BOT_TOKEN=process.env.BOT_TOKEN||"",OR_KEY=process.env.OPENROUTER_API_KEY||"",WEBHOOK_SECRET=process.env.WEBHOOK_SECRET||"",RAW_WEBHOOK_PATH_TOKEN=String(process.env.WEBHOOK_PATH_TOKEN||""),WEBHOOK_PATH_TOKEN=/^[A-Za-z0-9._~-]{8,256}$/.test(RAW_WEBHOOK_PATH_TOKEN)?RAW_WEBHOOK_PATH_TOKEN:"",GUEST_SECRET=process.env.GUEST_API_SECRET||"",LANGSEARCH_KEY=process.env.LANGSEARCH_API_KEY||"",BOT_USERNAME=String(process.env.BOT_USERNAME||"").replace(/^@/,""),TRIGGER=String(process.env.TRIGGER_COMMAND||"!ai").trim(),SYSTEM_PROMPT=process.env.SYSTEM_PROMPT||"You are a helpful AI assistant. Answer accurately, clearly, naturally, and concisely.",TEXT_MODEL=process.env.OPENROUTER_MODEL||"minimax/minimax-m2.7:free",FAST_MODEL=process.env.OPENROUTER_FAST_MODEL||TEXT_MODEL,DEEP_MODEL=process.env.OPENROUTER_DEEP_MODEL||TEXT_MODEL,VISION_MODEL=process.env.OPENROUTER_VISION_MODEL||"openrouter/free",FILE_MODEL=process.env.OPENROUTER_FILE_MODEL||"openrouter/free",PORT=Number(process.env.PORT||3000);
+import express from "express";const TG_API="https://api.telegram.org",OR_API="https://openrouter.ai/api/v1/chat/completions",OR_MODELS_API="https://openrouter.ai/api/v1/models",LANGSEARCH_API="https://api.langsearch.com/v1/web-search";const BOT_TOKEN=process.env.BOT_TOKEN||"",OR_KEY=process.env.OPENROUTER_API_KEY||"",WEBHOOK_SECRET=process.env.WEBHOOK_SECRET||"",RAW_WEBHOOK_PATH_TOKEN=String(process.env.WEBHOOK_PATH_TOKEN||""),WEBHOOK_PATH_TOKEN=/^[A-Za-z0-9._~-]{8,256}$/.test(RAW_WEBHOOK_PATH_TOKEN)?RAW_WEBHOOK_PATH_TOKEN:"",GUEST_SECRET=process.env.GUEST_API_SECRET||"",LANGSEARCH_KEY=process.env.LANGSEARCH_API_KEY||"",BOT_USERNAME=String(process.env.BOT_USERNAME||"").replace(/^@/,""),TRIGGER=String(process.env.TRIGGER_COMMAND||"!ai").trim(),SYSTEM_PROMPT=process.env.SYSTEM_PROMPT||"You are a helpful AI assistant. Answer accurately, clearly, naturally, and concisely.",PRIMARY_TEXT_MODEL=process.env.OPENROUTER_MODEL||"z-ai/glm-5.2:free",FALLBACK_TEXT_MODEL=process.env.OPENROUTER_MODEL_FALLBACK||"minimax/minimax-m2.7:free",TEXT_MODEL=PRIMARY_TEXT_MODEL,FAST_MODEL=process.env.OPENROUTER_FAST_MODEL||TEXT_MODEL,DEEP_MODEL=process.env.OPENROUTER_DEEP_MODEL||TEXT_MODEL,VISION_MODEL=process.env.OPENROUTER_VISION_MODEL||"openrouter/free",FILE_MODEL=process.env.OPENROUTER_FILE_MODEL||"openrouter/free",PORT=Number(process.env.PORT||3000);
 
 function clampInt(value,fallback,min,max){const n=Number(value);if(!Number.isFinite(n))return fallback;return Math.min(max,Math.max(min,Math.trunc(n)))}
 const HISTORY_PAIRS=clampInt(process.env.HISTORY_PAIRS,4,1,20),MAX_SEARCHES=clampInt(process.env.MAX_SEARCHES,3,0,10),MAX_TOOL_ROUNDS=clampInt(process.env.MAX_TOOL_ROUNDS,5,1,10),MAX_HISTORY_USERS=clampInt(process.env.MAX_HISTORY_USERS,5000,100,50000),MAX_MEMORY_ENTRIES=clampInt(process.env.MAX_MEMORY_ENTRIES,10000,1000,100000),MAX_USER_PROMPT_CHARS=clampInt(process.env.MAX_USER_PROMPT_CHARS,16000,1000,50000),MAX_FILE_TEXT_CHARS=clampInt(process.env.MAX_FILE_TEXT_CHARS,30000,1000,100000),MAX_DOWNLOAD_BYTES=clampInt(process.env.MAX_DOWNLOAD_BYTES,20*1024*1024,1024,20*1024*1024),MAX_OR_FILE_BYTES=clampInt(process.env.MAX_OPENROUTER_FILE_BYTES,12*1024*1024,1024,20*1024*1024),TG_LIMIT=4096,RICH_LIMIT=32768,STREAM_EDIT_MS=900,DRAFT_UPDATE_MS=900,TYPING_MS=4000,REQUEST_TIMEOUT_MS=clampInt(process.env.REQUEST_TIMEOUT_MS,45000,5000,120000),MAX_GLOBAL_CONCURRENCY=clampInt(process.env.MAX_GLOBAL_CONCURRENCY,8,1,32),SEEN_UPDATE_TTL_SEC=600,REACTION_MEMORY_TTL_MS=10*60*1000,STATS_SAMPLE_LIMIT=200,WEBHOOK_PATH=WEBHOOK_PATH_TOKEN?`/webhook/${WEBHOOK_PATH_TOKEN}`:"/webhook/UNCONFIGURED";
@@ -86,32 +86,38 @@ function decodeTextFile(buffer,fileName,mime=""){const normalized=normalizeMime(
 function filePartFromDownload(file,fileName,declaredMime){const mime=detectFileMime(fileName,declaredMime,file.httpMime,file.buffer);if(!mime||mime==="application/octet-stream"||file.buffer.length>MAX_OR_FILE_BYTES)return null;return{filename:String(fileName||"file").slice(0,255),file_data:`data:${mime};base64,${file.base64}`,mime}}
 
 const SEARCH_TOOL=[{type:"function",function:{name:"web_search",description:"Search the web for current, recent, live, or externally verifiable information. Use it when facts may have changed or need verification.",parameters:{type:"object",properties:{query:{type:"string",minLength:1,maxLength:500}},required:["query"],additionalProperties:false}}}];
+const TIME_TOOL=[{type:"function",function:{name:"get_time",description:"Get the current date and time for a place or timezone. This runs a web search query for it (it is a query against the web search service, not a dedicated time API), so use it whenever the user asks 'what time is it', 'what's today's date', or similar.",parameters:{type:"object",properties:{query:{type:"string",minLength:1,maxLength:200,description:"A city, region, country, or timezone name, e.g. 'Tokyo', 'UTC', 'New York'."}},required:["query"],additionalProperties:false}}}];
+const TOOL_NAMES=new Set(["web_search","get_time"]);
 
 async function searchWeb(query){if(!LANGSEARCH_KEY)throw new Error("Web search is not configured.");const cleanQuery=String(query||"").trim().slice(0,500);if(!cleanQuery)throw new Error("Search query is empty.");stats.searches++;const response=await fetch(LANGSEARCH_API,{method:"POST",headers:{"content-type":"application/json",authorization:`Bearer ${LANGSEARCH_KEY}`},body:JSON.stringify({query:cleanQuery,freshness:"noLimit",summary:true,count:5}),signal:AbortSignal.timeout(REQUEST_TIMEOUT_MS)});if(!response.ok){stats.searchFailures++;throw new Error(`Search service returned ${response.status}.`)}let data;try{data=await response.json()}catch{stats.searchFailures++;throw new Error("Search service returned invalid JSON.")}const results=Array.isArray(data?.data?.webPages?.value)?data.data.webPages.value:[];if(!results.length)return"No useful search results were returned.";return results.slice(0,5).map((item,index)=>{const name=String(item?.name||"Untitled").slice(0,180),url=String(item?.url||"").slice(0,500),summary=String(item?.summary||item?.snippet||"").slice(0,700);return[`[${index+1}] ${name}`,`URL: ${url}`,summary].join("\n")}).join("\n\n")}
+
+async function getTime(query){const clean=String(query||"").trim().slice(0,200);if(!clean)throw new Error("No location was supplied.");return searchWeb(`current date and time in ${clean}`)}
 
 async function fetchModelCatalog(force=false){const now=Date.now();if(!force&&modelCatalog&&now-modelCatalogLoadedAt<10*60*1000)return modelCatalog;if(!force&&modelCatalogAttemptedAt&&now-modelCatalogAttemptedAt<60*1000)return modelCatalog;if(!OR_KEY)return null;modelCatalogAttemptedAt=now;try{const response=await fetch(OR_MODELS_API,{headers:{authorization:`Bearer ${OR_KEY}`},signal:AbortSignal.timeout(15000)});if(!response.ok)return null;const data=await response.json();if(!Array.isArray(data?.data))return null;modelCatalog=new Map(data.data.map(item=>[String(item.id),item]));modelCatalogLoadedAt=now;modelCatalogAttemptedAt=now;return modelCatalog}catch{return null}}
 async function getModelInfo(model){const catalog=await fetchModelCatalog(false);return catalog?.get(model)||null}
 async function ensureImageModel(model){if(model==="openrouter/free")return true;const info=await getModelInfo(model),modalities=info?.architecture?.input_modalities;if(!Array.isArray(modalities))throw new Error("Vision model capability could not be verified. Set OPENROUTER_VISION_MODEL to a model with image input support.");if(!modalities.includes("image"))throw new Error(`Configured vision model does not accept image input: ${model}`);return true}
 function chooseModel({image,file,mode}){if(image)return VISION_MODEL;if(file)return FILE_MODEL;if(mode==="fast")return FAST_MODEL;if(mode==="deep")return DEEP_MODEL;return TEXT_MODEL}
+function chooseModelChain({image,file,mode}){if(image)return[VISION_MODEL];if(file)return[FILE_MODEL];const primary=chooseModel({image:false,file:false,mode}),chain=[primary];if(FALLBACK_TEXT_MODEL&&FALLBACK_TEXT_MODEL!==primary)chain.push(FALLBACK_TEXT_MODEL);return chain}
 
 async function buildOpenRouterBody(messages,model,mode,tools){const body={model,messages,stream:true};let info=null;if(mode==="deep"||tools?.length)info=await getModelInfo(model);const supported=new Set(Array.isArray(info?.supported_parameters)?info.supported_parameters:[]);if(tools?.length){const toolSupported=model==="openrouter/free"||supported.has("tools");if(toolSupported){body.tools=tools;body.tool_choice="auto"}}if(mode==="deep"&&supported.has("reasoning")){const efforts=info?.reasoning?.supported_efforts;if(Array.isArray(efforts)&&efforts.length){const desired=["high","max","xhigh","medium"].find(e=>efforts.includes(e));body.reasoning={effort:desired||efforts[0],exclude:true}}else body.reasoning={effort:"high",exclude:true}}return body}
 
 async function orRequest(messages,model,mode,tools=null){if(!OR_KEY)throw new Error("OPENROUTER_API_KEY is missing.");const body=await buildOpenRouterBody(messages,model,mode,tools);let response;try{response=await fetch(OR_API,{method:"POST",headers:{authorization:`Bearer ${OR_KEY}`,"content-type":"application/json",...(process.env.OPENROUTER_HTTP_REFERER?{"HTTP-Referer":process.env.OPENROUTER_HTTP_REFERER}:{}),...(process.env.OPENROUTER_X_TITLE?{"X-Title":process.env.OPENROUTER_X_TITLE}:{})},body:JSON.stringify(body),signal:AbortSignal.timeout(REQUEST_TIMEOUT_MS)})}catch(error){stats.openRouterErrors++;throw new Error(`OpenRouter request failed: ${error instanceof Error?error.message:"network error"}`)}if(!response.ok){stats.openRouterErrors++;const raw=await response.text().catch(()=>""),suffix=(()=>{try{const parsed=raw?JSON.parse(raw):null,detail=parsed?.error?.message||parsed?.message||"";return detail?`: ${sanitizeLog(detail).slice(0,300)}`:""}catch{return raw?`: ${sanitizeLog(raw).slice(0,300)}`:""}})();throw new OpenRouterError(response.status,`OpenRouter returned ${response.status}${suffix}`)}if(!response.body)throw new OpenRouterError(502,"OpenRouter returned an empty stream.");return response}
 class OpenRouterError extends Error{constructor(status,message){super(message);this.name="OpenRouterError";this.status=status}}
 
-function cleanSystem(userId,mode){const extra=[];if(mode==="fast")extra.push("Be concise and prioritize speed. Do not search the web unless the system permits it.");if(mode==="deep")extra.push("Be thorough. Verify time-sensitive claims with web search when appropriate.");if(LANGSEARCH_KEY&&mode!=="fast")extra.push("Use the web_search tool whenever information is current, recent, live, unstable, niche, or externally verifiable. Prefer searching over saying you do not know when external verification could answer the question. Do not search unnecessarily.");extra.push("Never expose internal tool calls, hidden reasoning, API keys, secrets, or implementation details.");extra.push("Return a normal user-facing answer. Do not use hidden XML-style reaction tags or metadata markers.");extra.push("Use clear Telegram Rich Text / Markdown formatting in the final answer when appropriate: short bold headings, readable paragraphs, bullets, numbered steps, inline code, and fenced code blocks.");const prefStyle=getPref(userId,"style"),prefLang=getPref(userId,"language");if(prefStyle)extra.push(`Preferred style: ${prefStyle}.`);if(prefLang)extra.push(`Preferred language: ${prefLang}.`);return SYSTEM_PROMPT+(extra.length?`\n\n${extra.join("\n")}`:"")}
+function cleanSystem(userId,mode){const extra=[];if(mode==="fast")extra.push("Be concise and prioritize speed. Do not search the web unless the system permits it.");if(mode==="deep")extra.push("Be thorough. Verify time-sensitive claims with web search when appropriate.");if(LANGSEARCH_KEY&&mode!=="fast"){extra.push("Use the web_search tool whenever information is current, recent, live, unstable, niche, or externally verifiable. Prefer searching over saying you do not know when external verification could answer the question. Do not search unnecessarily.");extra.push("Use the get_time tool whenever the user asks for the current date, current time, or 'what time is it' for a place or timezone. Never guess or state a time from memory.")}extra.push("Never expose internal tool calls, hidden reasoning, API keys, secrets, or implementation details.");extra.push("Return a normal user-facing answer. Do not use hidden XML-style reaction tags or metadata markers.");extra.push("Use clear Telegram Rich Text / Markdown formatting in the final answer when appropriate: short bold headings, readable paragraphs, bullets, numbered steps, inline code, and fenced code blocks.");return SYSTEM_PROMPT+(extra.length?`\n\n${extra.join("\n")}`:"")}
 
 async function buildMessages({userId,prompt,image,file,fileText,mode}){const messages=[{role:"system",content:cleanSystem(userId,mode)}];if(!image&&!file)messages.push(...getHistory(userId).slice(-(HISTORY_PAIRS*2)));if(image){messages.push({role:"user",content:[{type:"text",text:prompt||"Describe this image in detail."},{type:"image_url",image_url:{url:`data:${image.mime};base64,${image.base64}`}}]});return messages}if(file?.part){messages.push({role:"user",content:[{type:"text",text:prompt||`Analyze the attached file: ${file.name}`},{type:"file",file:{filename:file.part.filename,file_data:file.part.file_data}}]});return messages}const finalPrompt=fileText?[prompt||"Analyze this file.",`File name: ${file?.name||"unknown"}`,"File contents:",fileText].join("\n\n"):prompt;messages.push({role:"user",content:String(finalPrompt||"").slice(0,MAX_USER_PROMPT_CHARS+MAX_FILE_TEXT_CHARS)});return messages}
 
 async function streamOpenRouter(response,onPiece,onToolCalls){const reader=response.body.getReader(),decoder=new TextDecoder();let pending="";const toolCalls=[];while(true){const{value,done}=await reader.read();if(done)break;pending+=decoder.decode(value,{stream:true});const lines=pending.split(/\r?\n/);pending=lines.pop()||"";for(const rawLine of lines)processSseLine(rawLine,onPiece,toolCalls)}pending+=decoder.decode();if(pending)for(const rawLine of pending.split(/\r?\n/))processSseLine(rawLine,onPiece,toolCalls);if(typeof onToolCalls==="function")onToolCalls(toolCalls.filter(validToolCall))}
 function processSseLine(rawLine,onPiece,toolCalls){const line=rawLine.trim();if(!line.startsWith("data:"))return;const payload=line.slice(5).trim();if(!payload||payload==="[DONE]")return;let chunk;try{chunk=JSON.parse(payload)}catch{return}const delta=chunk?.choices?.[0]?.delta;if(Array.isArray(delta?.tool_calls))mergeTools(toolCalls,delta.tool_calls);const piece=typeof delta?.content==="string"?delta.content:"";if(piece&&typeof onPiece==="function")onPiece(piece)}
 function mergeTools(acc,deltas){for(const delta of deltas){const index=Number.isInteger(delta?.index)?delta.index:0;if(!acc[index])acc[index]={id:"",type:"function",function:{name:"",arguments:""}};if(delta?.id)acc[index].id=delta.id;if(delta?.function?.name)acc[index].function.name+=delta.function.name;if(delta?.function?.arguments)acc[index].function.arguments+=delta.function.arguments}}
-function validToolCall(call){return Boolean(call?.id&&call?.type==="function"&&call?.function?.name==="web_search")}
-function parseSearchQuery(call){try{const parsed=JSON.parse(call?.function?.arguments||"{}");return String(parsed?.query||"").trim().slice(0,500)}catch{return""}}
+function validToolCall(call){return Boolean(call?.id&&call?.type==="function"&&TOOL_NAMES.has(call?.function?.name))}
+function parseToolQuery(call,maxLen=500){try{const parsed=JSON.parse(call?.function?.arguments||"{}");return String(parsed?.query||"").trim().slice(0,maxLen)}catch{return""}}
 
-async function performToolCalls(toolCalls,searchState){const assistantToolCalls=toolCalls.map(call=>({id:call.id,type:"function",function:{name:"web_search",arguments:call.function?.arguments||"{}"}})),toolMessages=[];for(const call of toolCalls){let result="No search result.",query=parseSearchQuery(call);if(!query)result="The search request was invalid because no query was supplied.";else if(searchState.count>=MAX_SEARCHES)result="Search limit reached for this request. Continue using the information already gathered.";else{searchState.count++;try{result=await searchWeb(query)}catch(error){result=`Search failed gracefully: ${error instanceof Error?error.message:"unknown error"}`}}toolMessages.push({role:"tool",tool_call_id:call.id,content:result.slice(0,6000)})}return{assistantToolCalls,toolMessages}}
+async function performToolCalls(toolCalls,searchState){const assistantToolCalls=toolCalls.map(call=>({id:call.id,type:"function",function:{name:call.function?.name||"web_search",arguments:call.function?.arguments||"{}"}})),toolMessages=[];for(const call of toolCalls){const name=call.function?.name;let result="No result.";if(name==="get_time"){const query=parseToolQuery(call,200);if(!query)result="The time request was invalid because no location was supplied.";else if(searchState.count>=MAX_SEARCHES)result="Search limit reached for this request. Continue using the information already gathered.";else{searchState.count++;try{result=await getTime(query)}catch(error){result=`Time lookup failed gracefully: ${error instanceof Error?error.message:"unknown error"}`}}}else{const query=parseToolQuery(call,500);if(!query)result="The search request was invalid because no query was supplied.";else if(searchState.count>=MAX_SEARCHES)result="Search limit reached for this request. Continue using the information already gathered.";else{searchState.count++;try{result=await searchWeb(query)}catch(error){result=`Search failed gracefully: ${error instanceof Error?error.message:"unknown error"}`}}}toolMessages.push({role:"tool",tool_call_id:call.id,content:result.slice(0,6000)})}return{assistantToolCalls,toolMessages}}
 
-function thinkingHtml(label="🧠"){return`${label} <tg-thinking>Thinking…</tg-thinking>`}
+function escHtml(value){return String(value??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+function thinkingHtml(stage="Thinking…"){return`<b>${escHtml(stage)}</b>`}
 
 async function generate({chatId,userId,prompt,image,file,fileText,mode,replyTo,isPrivate}) {
   const started=Date.now();stats.requests++;
@@ -150,17 +156,16 @@ async function generate({chatId,userId,prompt,image,file,fileText,mode,replyTo,i
   };
 
   try{
-    finalModel=chooseModel({image:Boolean(image),file:Boolean(file),mode});
-    if(image)await ensureImageModel(finalModel);
+    const baseMessages=await buildMessages({userId,prompt,image,file,fileText,mode});
+    const modelChain=chooseModelChain({image:Boolean(image),file:Boolean(file),mode});
+    if(image)await ensureImageModel(modelChain[0]);
 
-    console.log(`[request] model=${sanitizeLog(finalModel)} mode=${mode} image=${Boolean(image)} file=${Boolean(file)}`);
-
-    const messages=await buildMessages({userId,prompt,image,file,fileText,mode});
+    console.log(`[request] models=${sanitizeLog(modelChain.join(" -> "))} mode=${mode} image=${Boolean(image)} file=${Boolean(file)}`);
 
     if(!isPrivate){
       const placeholder=await sendRichMessage(
         chatId,
-        thinkingHtml("🧠"),
+        thinkingHtml("🧠 Thinking…"),
         replyTo
       );
 
@@ -174,7 +179,7 @@ async function generate({chatId,userId,prompt,image,file,fileText,mode,replyTo,i
         const result=await sendRichMessageDraftHtml(
           chatId,
           draftIdValue,
-          thinkingHtml("🧠")
+          thinkingHtml("🧠 Thinking…")
         );
 
         if(result.ok)return;
@@ -183,7 +188,7 @@ async function generate({chatId,userId,prompt,image,file,fileText,mode,replyTo,i
 
         const fallback=await sendRichMessageHtml(
           chatId,
-          thinkingHtml("🧠"),
+          thinkingHtml("🧠 Thinking…"),
           replyTo
         );
 
@@ -193,12 +198,22 @@ async function generate({chatId,userId,prompt,image,file,fileText,mode,replyTo,i
       });
     }
 
-    setStatus(thinkingHtml("🧠"));
+    setStatus(thinkingHtml("🧠 Thinking…"));
 
     typingTimer=setInterval(()=>typing(chatId).catch(()=>{}),TYPING_MS);
     typingTimer.unref?.();
 
     const searchState={count:0};
+    let messages;
+
+    for(let mi=0;mi<modelChain.length;mi++){
+      finalModel=modelChain[mi];
+      messages=baseMessages.slice();
+      full="";
+      firstTokenRecorded=false;
+      searchState.count=0;
+
+      try{
 
     for(let round=0;round<MAX_TOOL_ROUNDS;round++){
       let roundText="";
@@ -213,7 +228,7 @@ async function generate({chatId,userId,prompt,image,file,fileText,mode,replyTo,i
         messages,
         finalModel,
         mode,
-        allowTools?SEARCH_TOOL:null
+        allowTools?[...SEARCH_TOOL,...TIME_TOOL]:null
       );
 
       await streamOpenRouter(
@@ -263,7 +278,7 @@ async function generate({chatId,userId,prompt,image,file,fileText,mode,replyTo,i
                         const fallback=
                           await sendRichMessageHtml(
                             chatId,
-                            thinkingHtml("🧠"),
+                            thinkingHtml("🧠 Thinking…"),
                             replyTo
                           );
 
@@ -324,17 +339,13 @@ async function generate({chatId,userId,prompt,image,file,fileText,mode,replyTo,i
         break;
       }
 
-      if(
-        validTools.some(
-          call=>call?.function?.name==="web_search"
-        )
-      ){
-        if(!generationStarted){
-          stopStatus();
-          setStatus(
-            thinkingHtml("🔎 Searching the web")
-          );
-        }
+      if(!generationStarted){
+        const hasSearch=validTools.some(call=>call?.function?.name==="web_search");
+        const hasTime=validTools.some(call=>call?.function?.name==="get_time");
+        stopStatus();
+        if(hasSearch&&hasTime)setStatus(thinkingHtml("🔎🕐 Searching the web and checking the time…"));
+        else if(hasTime)setStatus(thinkingHtml("🕐 Checking the time…"));
+        else setStatus(thinkingHtml("🔎 Searching the web…"));
       }
 
       const{
@@ -357,9 +368,24 @@ async function generate({chatId,userId,prompt,image,file,fileText,mode,replyTo,i
         stopStatus();
         setStatus(
           thinkingHtml(
-            "🧠 Reasoning from search results"
+            "🧠 Reasoning from results…"
           )
         );
+      }
+    }
+
+        break;
+
+      }catch(error){
+        if(firstTokenRecorded||mi===modelChain.length-1){
+          throw error;
+        }
+
+        console.warn(
+          `[fallback] model=${sanitizeLog(finalModel)} failed (${sanitizeLog(error?.message||error)}), trying next model`
+        );
+
+        continue;
       }
     }
 
@@ -788,52 +814,6 @@ async function command(chatId,userId,text,messageId){
       );
       return true;
 
-    case"/style":
-      if(!parsed.arg){
-        await sendRichMessage(
-          chatId,
-          "Usage: `/style concise`",
-          messageId
-        );
-      }else{
-        setPref(
-          userId,
-          "style",
-          parsed.arg
-        );
-
-        await sendRichMessage(
-          chatId,
-          `✍️ Style set to: *${esc(parsed.arg)}*`,
-          messageId
-        );
-      }
-
-      return true;
-
-    case"/language":
-      if(!parsed.arg){
-        await sendRichMessage(
-          chatId,
-          "Usage: `/language English`",
-          messageId
-        );
-      }else{
-        setPref(
-          userId,
-          "language",
-          parsed.arg
-        );
-
-        await sendRichMessage(
-          chatId,
-          `🌐 Language set to: *${esc(parsed.arg)}*`,
-          messageId
-        );
-      }
-
-      return true;
-
     case"/clear":
     case"/clearmemory":
       clearUserMemory(userId);
@@ -867,9 +847,9 @@ async function command(chatId,userId,text,messageId){
         [
           "🤖 *Active models*",
           "",
-          `Normal: \`${escCode(TEXT_MODEL)}\``,
-          `Fast: \`${escCode(FAST_MODEL)}\``,
-          `Deep: \`${escCode(DEEP_MODEL)}\``,
+          `Normal: \`${escCode(TEXT_MODEL)}\` → fallback \`${escCode(FALLBACK_TEXT_MODEL)}\``,
+          `Fast: \`${escCode(FAST_MODEL)}\` → fallback \`${escCode(FALLBACK_TEXT_MODEL)}\``,
+          `Deep: \`${escCode(DEEP_MODEL)}\` → fallback \`${escCode(FALLBACK_TEXT_MODEL)}\``,
           `Vision: \`${escCode(VISION_MODEL)}\``,
           `Files: \`${escCode(FILE_MODEL)}\``
         ].join("\n"),
@@ -901,17 +881,15 @@ function helpText(){
     "• `/clear` or `/clearmemory` clears your conversation history.",
     "• Memory is local to the running service and resets when it restarts.",
     "",
-    "🌐 *Web search*",
+    "🌐 *Web & time*",
     "• The bot can automatically search when information needs current, recent, live, niche, or external verification.",
-    "• Search is not used for every message, and fast mode does not use the search tool.",
+    "• The bot can look up the current date and time for a place by querying the web search service.",
+    "• Neither tool is used in fast mode.",
     "",
     "🖼 *Input*",
     "• Type a prompt or send a JPEG, PNG, or WEBP image.",
+    "• Editing a message you already sent makes the bot generate a brand new response to it.",
     "• Videos, GIFs, documents, audio, voice notes, stickers, and other media are not accepted.",
-    "",
-    "⚙️ *Preferences*",
-    "• `/style concise` — choose a response style.",
-    "• `/language English` — choose a preferred response language.",
     "",
     "📊 *Info*",
     "• `/status` — current runtime statistics.",
@@ -1054,8 +1032,12 @@ function stripTargeting(text){
 }
 
 async function handleUpdate(update){
+  /* Edited messages are treated exactly like new
+     incoming messages, so editing a message you
+     already sent triggers a brand new response. */
   const message=
-    update?.message;
+    update?.message||
+    update?.edited_message;
 
   if(!message?.chat)
     return;
