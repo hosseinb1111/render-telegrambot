@@ -343,6 +343,13 @@ const IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const FILE_MIME_BY_EXT = { txt: "text/plain", md: "text/markdown", markdown: "text/markdown", csv: "text/csv", json: "application/json", js: "text/javascript", mjs: "text/javascript", cjs: "text/javascript", ts: "text/typescript", jsx: "text/jsx", tsx: "text/tsx", py: "text/x-python", java: "text/x-java-source", c: "text/x-c", h: "text/x-c", cpp: "text/x-c++src", hpp: "text/x-c++src", cs: "text/plain", go: "text/plain", rs: "text/plain", php: "text/plain", rb: "text/plain", sh: "text/x-shellscript", bash: "text/x-shellscript", html: "text/html", htm: "text/html", css: "text/css", xml: "application/xml", yaml: "application/yaml", yml: "application/yaml", log: "text/plain", rtf: "application/rtf", pdf: "application/pdf", doc: "application/msword", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", xls: "application/vnd.ms-excel", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ppt: "application/vnd.ms-powerpoint", pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation", odt: "application/vnd.oasis.opendocument.text", ods: "application/vnd.oasis.opendocument.spreadsheet", odp: "application/vnd.oasis.opendocument.presentation", zip: "application/zip", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif", bmp: "image/bmp" };
 const TEXT_MIMES = new Set(["text/plain", "text/markdown", "text/csv", "text/javascript", "text/typescript", "text/jsx", "text/tsx", "text/x-python", "text/x-java-source", "text/x-c", "text/x-c++src", "text/x-shellscript", "text/html", "text/css", "application/json", "application/xml", "application/yaml", "application/rtf"]);
 
+// Extensions the bot can actually turn into something the model can read —
+// either decoded as inline text (decodeTextFile) or forwarded as a binary
+// file part to OpenRouter (filePartFromDownload). Used only to produce a
+// friendly, accurate list in /help and in the rejection message.
+const SUPPORTED_TEXT_EXTENSIONS = ["txt", "md", "markdown", "csv", "json", "js", "mjs", "cjs", "ts", "jsx", "tsx", "py", "java", "c", "h", "cpp", "hpp", "cs", "go", "rs", "php", "rb", "sh", "bash", "html", "htm", "css", "xml", "yaml", "yml", "log"];
+const SUPPORTED_BINARY_EXTENSIONS = ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp"];
+
 function extensionOf(value) { const clean = String(value || "").toLowerCase().split(/[?#]/)[0], index = clean.lastIndexOf("."); return index >= 0 ? clean.slice(index + 1) : ""; }
 function mimeFromExtension(value) { return FILE_MIME_BY_EXT[extensionOf(value)] || ""; }
 function normalizeMime(value) { return String(value || "").split(";", 1)[0].trim().toLowerCase(); }
@@ -387,7 +394,7 @@ async function telegramFile(fileId) {
 }
 function decodeTextFile(buffer, fileName, mime = "") {
   const normalized = normalizeMime(mime), ext = extensionOf(fileName),
-    textLike = TEXT_MIMES.has(normalized) || ["txt", "md", "markdown", "csv", "json", "js", "mjs", "cjs", "ts", "jsx", "tsx", "py", "java", "c", "h", "cpp", "hpp", "cs", "go", "rs", "php", "rb", "sh", "bash", "html", "htm", "css", "xml", "yaml", "yml", "log"].includes(ext);
+    textLike = TEXT_MIMES.has(normalized) || SUPPORTED_TEXT_EXTENSIONS.includes(ext);
   if (!textLike) return null;
   return Buffer.from(buffer).toString("utf8").replace(/^\uFEFF/, "").slice(0, MAX_FILE_TEXT_CHARS);
 }
@@ -422,7 +429,39 @@ async function searchWeb(query) {
   }).join("\n\n");
 }
 
-// Dedicated time lookup via timeapi.io — no web search involved.
+// Computes an ISO 8601 string (with correct UTC offset) and a Unix
+// timestamp (epoch seconds, timezone-independent) for a given IANA zone,
+// without relying on any third-party field for either value.
+function isoAndUnixForZone(timezone) {
+  const now = new Date();
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit"
+  });
+  const parts = dtf.formatToParts(now).reduce((acc, part) => {
+    if (part.type !== "literal") acc[part.type] = part.value;
+    return acc;
+  }, {});
+  // Telegram/ICU can render hour "24" for midnight in some locales; normalize.
+  if (parts.hour === "24") parts.hour = "00";
+  const asUTC = Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+    Number(parts.hour), Number(parts.minute), Number(parts.second)
+  );
+  const offsetMin = Math.round((asUTC - now.getTime()) / 60000);
+  const sign = offsetMin >= 0 ? "+" : "-", abs = Math.abs(offsetMin);
+  const offsetHours = String(Math.floor(abs / 60)).padStart(2, "0"),
+    offsetMinutes = String(abs % 60).padStart(2, "0");
+  const iso8601 = `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}${sign}${offsetHours}:${offsetMinutes}`;
+  return { iso8601, unix: Math.floor(now.getTime() / 1000) };
+}
+
+// Dedicated time lookup via timeapi.io — no web search involved. The
+// human-readable date/time/day-of-week/DST fields still come from the API;
+// iso8601 and unix are computed locally so they're always present even if
+// the API's own dateTime field is ambiguous about offset.
 async function get_time(timezone = "Asia/Tehran") {
   try {
     const url =
@@ -434,13 +473,21 @@ async function get_time(timezone = "Asia/Tehran") {
       );
     }
     const data = await response.json();
+    let iso8601 = "", unix = 0;
+    try {
+      const computed = isoAndUnixForZone(data.timeZone || timezone);
+      iso8601 = computed.iso8601;
+      unix = computed.unix;
+    } catch { /* fall through with empty values if the zone can't be resolved locally */ }
     return {
       timezone: data.timeZone,
       date: data.date,
       time: data.time,
       dateTime: data.dateTime,
       dayOfWeek: data.dayOfWeek,
-      dstActive: data.dstActive
+      dstActive: data.dstActive,
+      iso8601,
+      unix
     };
   } catch (error) {
     console.error("get_time error:", error);
@@ -532,7 +579,7 @@ function cleanSystem() {
   if (LANGSEARCH_KEY) {
     extra.push("Use the web_search tool whenever information is current, recent, live, unstable, niche, or externally verifiable. Prefer searching over saying you do not know when external verification could answer the question. Do not search unnecessarily.");
   }
-  extra.push("Use the get_time tool whenever the user asks for the current date, current time, or 'what time is it' for a place or timezone. Never guess or state a time from memory.");
+  extra.push("Use the get_time tool whenever the user asks for the current date, current time, or 'what time is it' for a place or timezone. Never guess or state a time from memory. When reporting the time back to the user, always state it in both ISO 8601 format (e.g. 2026-03-09T01:38:00+03:30) and as a Unix timestamp (epoch seconds), in addition to any human-readable form you choose to include.");
   extra.push("Reply in the same language the user is writing in. Do not ask the user which language or style to use — infer it from their message.");
   extra.push("Never expose internal tool calls, hidden reasoning, API keys, secrets, or implementation details.");
   extra.push("Return a normal user-facing answer. Do not use hidden XML-style reaction tags or metadata markers.");
@@ -617,7 +664,13 @@ async function performToolCalls(toolCalls, searchState) {
       const timezone = parseToolArg(call, "timezone", 100) || "Asia/Tehran";
       const timeInfo = await get_time(timezone);
       result = timeInfo
-        ? [`Time zone: ${timeInfo.timezone}`, `Date: ${timeInfo.date}`, `Time: ${timeInfo.time}`, `Day of week: ${timeInfo.dayOfWeek}`, `DST active: ${timeInfo.dstActive}`].join("\n")
+        ? [
+            `Time zone: ${timeInfo.timezone}`,
+            `ISO 8601: ${timeInfo.iso8601 || "unavailable"}`,
+            `Unix timestamp: ${timeInfo.unix || "unavailable"}`,
+            `Day of week: ${timeInfo.dayOfWeek}`,
+            `DST active: ${timeInfo.dstActive}`
+          ].join("\n")
         : `Time lookup failed for time zone "${timezone}". Ask the user to confirm the city or time zone.`;
     } else {
       const query = parseToolQuery(call, 500);
@@ -1060,7 +1113,7 @@ async function command(chatId, userId, text, messageId) {
         "",
         "Send me a message to chat.",
         "",
-        "You can type a prompt or send an image.",
+        "You can type a prompt, send an image, or send a supported document.",
         "",
         "Use /help to see everything I support."
       ].join("\n"), messageId);
@@ -1115,11 +1168,16 @@ function helpText() {
     "",
     "🌐 *Web & time*",
     "• I automatically search the web when a question needs current, recent, or external information.",
-    "• I can look up the current date and time for any place using a dedicated time API.",
+    "• I can look up the current date and time for any place, reported in both ISO 8601 and Unix timestamp form.",
     "",
-    "🖼 *Input*",
-    "• Type a prompt or send a JPEG, PNG, or WEBP image.",
-    "• Videos, GIFs, documents, audio, voice notes, stickers, and other media are not accepted.",
+    "🖼 *Images*",
+    "• Send a JPEG, PNG, or WEBP image, with or without a caption.",
+    "",
+    "📎 *Documents*",
+    "• Text-based files: " + esc(SUPPORTED_TEXT_EXTENSIONS.map(ext => `.${ext}`).join(", ")),
+    "• Office/PDF files: " + esc(SUPPORTED_BINARY_EXTENSIONS.map(ext => `.${ext}`).join(", ")),
+    `• Max file size: ${Math.floor(MAX_DOWNLOAD_BYTES / (1024 * 1024))} MB.`,
+    "• Videos, GIFs, audio, voice notes, and stickers are not accepted.",
     "",
     "📊 *Info*",
     "• `/status` or `/stats` — current runtime statistics.",
@@ -1194,7 +1252,8 @@ async function handleUpdate(update) {
   const sourceText = text || caption;
   const photos = Array.isArray(message.photo) ? message.photo : [];
   const isImage = photos.length > 0;
-  const unsupportedMedia = Boolean(message.document || message.video || message.animation || message.audio || message.voice || message.video_note || message.sticker || message.contact || message.location || message.poll || message.venue);
+  const isDocument = Boolean(message.document);
+  const unsupportedMedia = Boolean(message.video || message.animation || message.audio || message.voice || message.video_note || message.sticker || message.contact || message.location || message.poll || message.venue);
   const isPrivate = message.chat.type === "private";
 
   if (!isEdited) {
@@ -1204,17 +1263,17 @@ async function handleUpdate(update) {
 
   if (!isPrivate) {
     const targeted = botMentioned(sourceText) || triggerUsed(sourceText) || repliedToBot(message);
-    if (!targeted && !isImage) return;
+    if (!targeted && !isImage && !isDocument) return;
   }
 
   if (unsupportedMedia) {
-    await sendRichMessage(chatId, "📝 *Type a prompt or send an image.*", messageId);
+    await sendRichMessage(chatId, "📝 *Type a prompt, send an image, or send a supported document. See /help for the full list.*", messageId);
     return;
   }
 
   const prompt = stripTargeting(sourceText).slice(0, MAX_USER_PROMPT_CHARS);
-  if (!prompt && !isImage) {
-    await sendRichMessage(chatId, "📝 *Type a prompt or send an image.*", messageId);
+  if (!prompt && !isImage && !isDocument) {
+    await sendRichMessage(chatId, "📝 *Type a prompt, send an image, or send a supported document.*", messageId);
     return;
   }
 
@@ -1239,15 +1298,44 @@ async function handleUpdate(update) {
     }
   }
 
+  let fileObj = null, fileText = "";
+  if (isDocument) {
+    stats.files++;
+    try {
+      const doc = message.document;
+      const downloaded = await telegramFile(doc.file_id);
+      const fileName = doc.file_name || "file";
+
+      // Prefer inline text decoding for anything recognizably text-like...
+      const text = decodeTextFile(downloaded.buffer, fileName, doc.mime_type);
+      if (text !== null) {
+        fileText = text;
+        fileObj = { name: fileName, part: null };
+      } else {
+        // ...otherwise try forwarding it as a binary file part (PDF, Office
+        // documents, etc.) for the file-capable model to read directly.
+        const part = filePartFromDownload(downloaded, fileName, doc.mime_type);
+        if (!part) {
+          await sendRichMessage(chatId, "📝 *That file type isn't supported. See /help for the list of supported document formats.*", messageId);
+          return;
+        }
+        fileObj = { name: fileName, part };
+      }
+    } catch (error) {
+      await sendRichMessage(chatId, `❌ File processing failed: ${esc(error instanceof Error ? error.message : "unknown error")}`, messageId);
+      return;
+    }
+  }
+
   return enqueueUser(userId, () => {
     if (isEdited) removeHistoryTurnByMessageId(userId, messageId);
     return generate({
       chatId,
       userId,
-      prompt: prompt || (isImage ? "Describe this image in detail." : ""),
+      prompt: prompt || (isImage ? "Describe this image in detail." : (isDocument ? "Analyze the attached file." : "")),
       image,
-      file: null,
-      fileText: "",
+      file: fileObj,
+      fileText,
       replyTo: messageId,
       messageId,
       isPrivate
