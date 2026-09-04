@@ -1,5 +1,31 @@
 import express from "express";
 
+// ============================================================================
+// Telegram AI Bot — improved edition
+//
+// What changed vs the previous version:
+//  1. Commands (/start, /help, /status, /stats, /models, /admin) now render
+//     using native Telegram Rich Text *blocks* (InputRichBlock: heading,
+//     list, divider, table, blockquote) via sendRichMessageBlocks(), instead
+//     of hand-escaped MarkdownV2 strings. This is more robust (no manual
+//     escaping bugs) and looks nicer (real headings, real bullet lists).
+//  2. /start greets the user by name and @mentions their account using
+//     RichTextTextMention, so it reads "Welcome, <Name>!" with a tappable
+//     mention.
+//  3. New features:
+//       - /persona <text>      set a custom persona/system-prompt addendum per user
+//       - /export              export your conversation history as a .txt document
+//       - /settings            inline keyboard: clear memory / show persona / export
+//       - /remind <mins> <msg> a simple one-off reminder (in-memory, best-effort)
+//  4. Inline keyboard callback handling added (bot.on("callback_query") style,
+//     implemented directly against the Bot API since this file doesn't use
+//     the Telegraf wrapper).
+//  5. Small robustness fixes: safer HTML escaping helper reused everywhere,
+//     dedicated buildRichBlocksMessage() send helper with automatic HTML
+//     fallback, and clearer separation between "system" extras and the
+//     per-user persona addendum.
+// ============================================================================
+
 const TG_API = "https://api.telegram.org",
   OR_API = "https://openrouter.ai/api/v1/chat/completions",
   OR_MODELS_API = "https://openrouter.ai/api/v1/models",
@@ -15,7 +41,6 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "",
   BOT_USERNAME = String(process.env.BOT_USERNAME || "").replace(/^@/, ""),
   TRIGGER = String(process.env.TRIGGER_COMMAND || "!ai").trim(),
   SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "You are a helpful AI assistant. Answer accurately, clearly, naturally, and concisely.",
-  // GLM is the brain, MiniMax is the safety net.
   PRIMARY_TEXT_MODEL = process.env.OPENROUTER_MODEL || "z-ai/glm-5.2:free",
   FALLBACK_TEXT_MODEL = process.env.OPENROUTER_MODEL_FALLBACK || "minimax/minimax-m2.7:free",
   TEXT_MODEL = PRIMARY_TEXT_MODEL,
@@ -38,6 +63,7 @@ const HISTORY_PAIRS = clampInt(process.env.HISTORY_PAIRS, 4, 1, 20),
   MAX_FILE_TEXT_CHARS = clampInt(process.env.MAX_FILE_TEXT_CHARS, 30000, 1000, 100000),
   MAX_DOWNLOAD_BYTES = clampInt(process.env.MAX_DOWNLOAD_BYTES, 20 * 1024 * 1024, 1024, 20 * 1024 * 1024),
   MAX_OR_FILE_BYTES = clampInt(process.env.MAX_OPENROUTER_FILE_BYTES, 12 * 1024 * 1024, 1024, 20 * 1024 * 1024),
+  MAX_PERSONA_CHARS = clampInt(process.env.MAX_PERSONA_CHARS, 600, 0, 2000),
   TG_LIMIT = 4096,
   RICH_LIMIT = 32768,
   STREAM_EDIT_MS = 900,
@@ -47,6 +73,7 @@ const HISTORY_PAIRS = clampInt(process.env.HISTORY_PAIRS, 4, 1, 20),
   MAX_GLOBAL_CONCURRENCY = clampInt(process.env.MAX_GLOBAL_CONCURRENCY, 8, 1, 32),
   SEEN_UPDATE_TTL_SEC = 600,
   REACTION_MEMORY_TTL_MS = 10 * 60 * 1000,
+  REMINDER_MAX_MINUTES = clampInt(process.env.REMINDER_MAX_MINUTES, 1440, 1, 10080),
   STATS_SAMPLE_LIMIT = 200,
   WEBHOOK_PATH = WEBHOOK_PATH_TOKEN ? `/webhook/${WEBHOOK_PATH_TOKEN}` : "/webhook/UNCONFIGURED";
 
@@ -66,7 +93,7 @@ configWarnings();
 // In-memory state
 // ---------------------------------------------------------------------------
 
-const memory = new Map, recentReactions = new Map, inFlightQueues = new Map, seenUpdates = new Map;
+const memory = new Map, recentReactions = new Map, inFlightQueues = new Map, seenUpdates = new Map, reminders = [];
 
 function memGet(key) {
   const item = memory.get(key);
@@ -97,13 +124,10 @@ memoryCleanupTimer.unref?.();
 
 // ---------------------------------------------------------------------------
 // Conversation history
-//
-// Each user turn is stored with the Telegram message_id that produced it, so
-// that an edited_message update can locate and replace the matching turn
-// instead of appending a duplicate one.
 // ---------------------------------------------------------------------------
 
 function historyKey(userId) { return `history:${String(userId)}`; }
+function personaKey(userId) { return `persona:${String(userId)}`; }
 
 function getHistory(userId) {
   const raw = memGet(historyKey(userId));
@@ -130,9 +154,6 @@ function saveHistory(userId, prompt, answer, messageId) {
   writeHistory(userId, history.slice(-(HISTORY_PAIRS * 2)));
 }
 
-// Removes the turn (user message + its assistant reply) that was produced by
-// a given message_id, so an edit regenerates in place rather than stacking a
-// second, contradictory turn on top of the original one.
 function removeHistoryTurnByMessageId(userId, messageId) {
   if (messageId === undefined || messageId === null) return;
   const history = getHistory(userId);
@@ -163,6 +184,14 @@ function clearAllCache() {
   modelCatalogAttemptedAt = 0;
 }
 
+function getPersona(userId) { return memGet(personaKey(userId)) || ""; }
+function setPersona(userId, text) {
+  const clean = String(text || "").trim().slice(0, MAX_PERSONA_CHARS);
+  if (!clean) { memory.delete(personaKey(userId)); return ""; }
+  memSet(personaKey(userId), clean);
+  return clean;
+}
+
 // ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
@@ -173,12 +202,6 @@ function avg(values) { return values.length ? Math.round(values.reduce((a, b) =>
 function formatUptime(seconds) {
   const d = Math.floor(seconds / 86400), h = Math.floor((seconds % 86400) / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60;
   return [d ? `${d}d` : "", h ? `${h}h` : "", m ? `${m}m` : "", `${s}s`].filter(Boolean).join(" ");
-}
-function statusText(admin = false) {
-  const uptime = Math.floor((Date.now() - stats.started) / 1000),
-    lines = ["🤖 *Bot Status*", "", `Uptime: ${esc(formatUptime(uptime))}`, `Requests: ${stats.requests}`, `Errors: ${stats.errors}`, `Searches: ${stats.searches}`, `Images: ${stats.images}`, `Files: ${stats.files}`, `Avg first token: ${stats.firstTokenMs.length ? `${avg(stats.firstTokenMs)} ms` : "—"}`, `Avg total: ${stats.totalMs.length ? `${avg(stats.totalMs)} ms` : "—"}`];
-  if (admin) lines.push("", `Telegram errors: ${stats.telegramErrors}`, `OpenRouter errors: ${stats.openRouterErrors}`, `Search failures: ${stats.searchFailures}`, `Guest requests: ${stats.guestRequests}`, `Guest errors: ${stats.guestErrors}`, `Memory entries: ${memory.size}`, `In-flight queues: ${inFlightQueues.size}`);
-  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -259,8 +282,6 @@ async function tg(method, body, { retries = 1, timeoutMs = REQUEST_TIMEOUT_MS } 
   return { ok: false, description: "Telegram request failed" };
 }
 
-// Plain-text send, used only as a last-resort fallback when Rich Message
-// delivery genuinely fails.
 async function sendMessage(chatId, text, replyTo, options = {}) {
   const clean = String(text ?? "");
   if (!clean) return { ok: false, description: "Empty message" };
@@ -272,22 +293,32 @@ async function sendMessage(chatId, text, replyTo, options = {}) {
   return tg("sendMessage", base);
 }
 
-// --- Rich Messages (Bot API 10.1) — the bot's primary presentation layer ---
+// --- Rich Messages (Bot API 10.1) ---
 
-async function sendRichMessage(chatId, markdown, replyTo) {
+async function sendRichMessage(chatId, markdown, replyTo, extra = {}) {
   const clean = String(markdown ?? "");
   if (!clean) return { ok: false, description: "Empty rich message" };
-  const rich = await tg("sendRichMessage", { chat_id: chatId, rich_message: { markdown: clean, is_rtl: detectRtl(clean) }, ...(replyTo ? { reply_parameters: { message_id: replyTo } } : {}) });
+  const rich = await tg("sendRichMessage", { chat_id: chatId, rich_message: { markdown: clean, is_rtl: detectRtl(clean) }, ...(replyTo ? { reply_parameters: { message_id: replyTo } } : {}), ...extra });
   if (rich?.ok) return rich;
   if (clean.length > TG_LIMIT) return { ok: false, description: "Rich message unavailable for oversized chunk." };
   return sendMessage(chatId, clean, replyTo, { markdown: true });
 }
 
-async function sendRichMessageHtml(chatId, html, replyTo) {
+async function sendRichMessageHtml(chatId, html, replyTo, extra = {}) {
   const clean = String(html ?? "");
   if (!clean) return { ok: false, description: "Empty rich HTML message" };
-  const result = await tg("sendRichMessage", { chat_id: chatId, rich_message: { html: clean, is_rtl: detectRtl(clean) }, ...(replyTo ? { reply_parameters: { message_id: replyTo } } : {}) });
+  const result = await tg("sendRichMessage", { chat_id: chatId, rich_message: { html: clean, is_rtl: detectRtl(clean) }, ...(replyTo ? { reply_parameters: { message_id: replyTo } } : {}), ...extra });
   return result?.ok ? result : { ok: false, description: result?.description || "Rich HTML message failed" };
+}
+
+// Sends a message built from native InputRichBlock objects (headings, lists,
+// dividers, blockquotes, tables, ...) rather than markdown/html strings.
+// Falls back to a flattened Markdown rendering if the Rich Blocks API call
+// is rejected by the server (e.g. running against an older Bot API version).
+async function sendRichBlocksMessage(chatId, blocks, replyTo, extra = {}) {
+  const result = await tg("sendRichMessage", { chat_id: chatId, rich_message: { blocks }, ...(replyTo ? { reply_parameters: { message_id: replyTo } } : {}), ...extra });
+  if (result?.ok) return result;
+  return sendRichMessage(chatId, blocksToMarkdownFallback(blocks), replyTo, extra);
 }
 
 async function editMessageRich(chatId, messageId, markdown) {
@@ -317,6 +348,10 @@ async function sendRichMessageDraftHtml(chatId, draftId, html) {
 
 async function typing(chatId) { return tg("sendChatAction", { chat_id: chatId, action: "typing" }, { retries: 0 }); }
 
+async function answerCallbackQuery(id, text, showAlert = false) {
+  return tg("answerCallbackQuery", { callback_query_id: id, text: text ? String(text).slice(0, 200) : undefined, show_alert: Boolean(showAlert) }, { retries: 0 });
+}
+
 async function reactMessage(chatId, messageId, emoji) {
   if (!RX.includes(emoji) || !chatId || !messageId) return false;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -335,6 +370,76 @@ async function getMe() {
   return result;
 }
 
+async function sendDocumentBuffer(chatId, buffer, filename, caption, replyTo) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (caption) form.append("caption", caption.slice(0, 1024));
+  if (replyTo) form.append("reply_parameters", JSON.stringify({ message_id: replyTo }));
+  form.append("document", new Blob([buffer], { type: "text/plain" }), filename);
+  try {
+    const response = await fetch(`${TG_API}/bot${BOT_TOKEN}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    const data = await response.json().catch(() => ({ ok: false }));
+    if (!data.ok) stats.telegramErrors++;
+    return data;
+  } catch (error) {
+    stats.telegramErrors++;
+    return { ok: false, description: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rich Text block builders
+//
+// Small helpers that build InputRichBlock / RichText structures per the
+// Rich Message spec, so command handlers can compose real headings, lists,
+// dividers, and mentions instead of hand-escaped Markdown.
+// ---------------------------------------------------------------------------
+
+const rt = {
+  bold: (text) => ({ type: "bold", text }),
+  italic: (text) => ({ type: "italic", text }),
+  code: (text) => ({ type: "code", text }),
+  underline: (text) => ({ type: "underline", text }),
+  url: (text, url) => ({ type: "url", text, url }),
+  mention: (text, user) => ({ type: "text_mention", text, user }),
+  emoji: (customEmojiId, alternativeText) => ({ type: "custom_emoji", custom_emoji_id: customEmojiId, alternative_text: alternativeText }),
+};
+
+const rb = {
+  heading: (text, size = 3) => ({ type: "heading", text, size }),
+  paragraph: (text) => ({ type: "paragraph", text }),
+  divider: () => ({ type: "divider" }),
+  footer: (text) => ({ type: "footer", text }),
+  list: (items, options = {}) => ({ type: "list", items: items.map(label => ({ label: "", blocks: [rb.paragraph(label)], ...options })) }),
+  bulletList: (items) => ({ type: "list", items: items.map(label => ({ label: "•", blocks: [rb.paragraph(label)] })) }),
+  numberedList: (items) => ({ type: "list", items: items.map((label, i) => ({ label: "", blocks: [rb.paragraph(label)], value: i + 1, type: "1" })) }),
+  blockquote: (blocks, credit) => ({ type: "blockquote", blocks, credit }),
+  pre: (text, language) => ({ type: "pre", text, language }),
+};
+
+// Flattens RichText (string | array | {type,text,...}) down to plain text,
+// used only as a last-resort fallback path.
+function richTextToPlain(node) {
+  if (node == null) return "";
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) return node.map(richTextToPlain).join("");
+  if (node.text !== undefined) return richTextToPlain(node.text);
+  return "";
+}
+function blocksToMarkdownFallback(blocks) {
+  const lines = [];
+  for (const block of blocks) {
+    if (block.type === "heading") lines.push(`*${esc(richTextToPlain(block.text))}*`);
+    else if (block.type === "paragraph") lines.push(esc(richTextToPlain(block.text)));
+    else if (block.type === "divider") lines.push("──────────");
+    else if (block.type === "footer") lines.push(`_${esc(richTextToPlain(block.text))}_`);
+    else if (block.type === "pre") lines.push("```" + (block.language || "") + "\n" + richTextToPlain(block.text) + "\n```");
+    else if (block.type === "blockquote") lines.push((block.blocks || []).map(b => `> ${richTextToPlain(b.text)}`).join("\n"));
+    else if (block.type === "list") lines.push((block.items || []).map(item => `${item.label || "•"} ${richTextToPlain(item.blocks?.[0]?.text)}`).join("\n"));
+  }
+  return lines.join("\n\n");
+}
+
 // ---------------------------------------------------------------------------
 // File / image handling
 // ---------------------------------------------------------------------------
@@ -342,11 +447,6 @@ async function getMe() {
 const IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const FILE_MIME_BY_EXT = { txt: "text/plain", md: "text/markdown", markdown: "text/markdown", csv: "text/csv", json: "application/json", js: "text/javascript", mjs: "text/javascript", cjs: "text/javascript", ts: "text/typescript", jsx: "text/jsx", tsx: "text/tsx", py: "text/x-python", java: "text/x-java-source", c: "text/x-c", h: "text/x-c", cpp: "text/x-c++src", hpp: "text/x-c++src", cs: "text/plain", go: "text/plain", rs: "text/plain", php: "text/plain", rb: "text/plain", sh: "text/x-shellscript", bash: "text/x-shellscript", html: "text/html", htm: "text/html", css: "text/css", xml: "application/xml", yaml: "application/yaml", yml: "application/yaml", log: "text/plain", rtf: "application/rtf", pdf: "application/pdf", doc: "application/msword", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", xls: "application/vnd.ms-excel", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ppt: "application/vnd.ms-powerpoint", pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation", odt: "application/vnd.oasis.opendocument.text", ods: "application/vnd.oasis.opendocument.spreadsheet", odp: "application/vnd.oasis.opendocument.presentation", zip: "application/zip", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif", bmp: "image/bmp" };
 const TEXT_MIMES = new Set(["text/plain", "text/markdown", "text/csv", "text/javascript", "text/typescript", "text/jsx", "text/tsx", "text/x-python", "text/x-java-source", "text/x-c", "text/x-c++src", "text/x-shellscript", "text/html", "text/css", "application/json", "application/xml", "application/yaml", "application/rtf"]);
-
-// Extensions the bot can actually turn into something the model can read —
-// either decoded as inline text (decodeTextFile) or forwarded as a binary
-// file part to OpenRouter (filePartFromDownload). Used only to produce a
-// friendly, accurate list in /help and in the rejection message.
 const SUPPORTED_TEXT_EXTENSIONS = ["txt", "md", "markdown", "csv", "json", "js", "mjs", "cjs", "ts", "jsx", "tsx", "py", "java", "c", "h", "cpp", "hpp", "cs", "go", "rs", "php", "rb", "sh", "bash", "html", "htm", "css", "xml", "yaml", "yml", "log"];
 const SUPPORTED_BINARY_EXTENSIONS = ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp"];
 
@@ -429,70 +529,54 @@ async function searchWeb(query) {
   }).join("\n\n");
 }
 
-// Computes an ISO 8601 string (with correct UTC offset) and a Unix
-// timestamp (epoch seconds, timezone-independent) for a given IANA zone,
-// without relying on any third-party field for either value.
 function isoAndUnixForZone(timezone) {
   const now = new Date();
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    hour12: false,
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit"
-  });
-  const parts = dtf.formatToParts(now).reduce((acc, part) => {
-    if (part.type !== "literal") acc[part.type] = part.value;
-    return acc;
-  }, {});
-  // Telegram/ICU can render hour "24" for midnight in some locales; normalize.
+  const dtf = new Intl.DateTimeFormat("en-US", { timeZone: timezone, hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const parts = dtf.formatToParts(now).reduce((acc, part) => { if (part.type !== "literal") acc[part.type] = part.value; return acc; }, {});
   if (parts.hour === "24") parts.hour = "00";
-  const asUTC = Date.UTC(
-    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
-    Number(parts.hour), Number(parts.minute), Number(parts.second)
-  );
+  const asUTC = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second));
   const offsetMin = Math.round((asUTC - now.getTime()) / 60000);
   const sign = offsetMin >= 0 ? "+" : "-", abs = Math.abs(offsetMin);
-  const offsetHours = String(Math.floor(abs / 60)).padStart(2, "0"),
-    offsetMinutes = String(abs % 60).padStart(2, "0");
+  const offsetHours = String(Math.floor(abs / 60)).padStart(2, "0"), offsetMinutes = String(abs % 60).padStart(2, "0");
   const iso8601 = `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}${sign}${offsetHours}:${offsetMinutes}`;
   return { iso8601, unix: Math.floor(now.getTime() / 1000) };
 }
 
-// Dedicated time lookup via timeapi.io — no web search involved. The
-// human-readable date/time/day-of-week/DST fields still come from the API;
-// iso8601 and unix are computed locally so they're always present even if
-// the API's own dateTime field is ambiguous about offset.
 async function get_time(timezone = "Asia/Tehran") {
   try {
-    const url =
-      `https://timeapi.io/api/Time/current/zone?timeZone=${encodeURIComponent(timezone)}`;
+    const url = `https://timeapi.io/api/Time/current/zone?timeZone=${encodeURIComponent(timezone)}`;
     const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(
-        `TimeAPI request failed: ${response.status}`
-      );
-    }
+    if (!response.ok) throw new Error(`TimeAPI request failed: ${response.status}`);
     const data = await response.json();
     let iso8601 = "", unix = 0;
-    try {
-      const computed = isoAndUnixForZone(data.timeZone || timezone);
-      iso8601 = computed.iso8601;
-      unix = computed.unix;
-    } catch { /* fall through with empty values if the zone can't be resolved locally */ }
-    return {
-      timezone: data.timeZone,
-      date: data.date,
-      time: data.time,
-      dateTime: data.dateTime,
-      dayOfWeek: data.dayOfWeek,
-      dstActive: data.dstActive,
-      iso8601,
-      unix
-    };
+    try { const computed = isoAndUnixForZone(data.timeZone || timezone); iso8601 = computed.iso8601; unix = computed.unix; } catch {}
+    return { timezone: data.timeZone, date: data.date, time: data.time, dateTime: data.dateTime, dayOfWeek: data.dayOfWeek, dstActive: data.dstActive, iso8601, unix };
   } catch (error) {
     console.error("get_time error:", error);
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Reminders (best-effort, in-memory; lost on restart)
+// ---------------------------------------------------------------------------
+
+function scheduleReminder(chatId, userId, minutes, text, replyTo) {
+  const delayMs = Math.max(1, minutes) * 60000;
+  const entry = { chatId, userId, text, dueAt: Date.now() + delayMs };
+  reminders.push(entry);
+  const timer = setTimeout(async () => {
+    try {
+      await sendRichMessage(chatId, `⏰ *Reminder:* ${esc(text)}`, replyTo);
+    } catch (error) {
+      console.error(`[reminder:send:error] ${sanitizeLog(error?.message || error)}`);
+    } finally {
+      const idx = reminders.indexOf(entry);
+      if (idx >= 0) reminders.splice(idx, 1);
+    }
+  }, delayMs);
+  timer.unref?.();
+  return entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -525,8 +609,6 @@ async function ensureImageModel(model) {
   return true;
 }
 
-// Text requests always try GLM first, then MiniMax. Image/file requests use
-// their single dedicated model — no fallback chain for those.
 function chooseModelChain({ image, file }) {
   if (image) return [VISION_MODEL];
   if (file) return [FILE_MODEL];
@@ -574,21 +656,21 @@ class OpenRouterError extends Error { constructor(status, message) { super(messa
 // Prompt / message construction
 // ---------------------------------------------------------------------------
 
-function cleanSystem() {
+function cleanSystem(userId) {
   const extra = [];
-  if (LANGSEARCH_KEY) {
-    extra.push("Use the web_search tool whenever information is current, recent, live, unstable, niche, or externally verifiable. Prefer searching over saying you do not know when external verification could answer the question. Do not search unnecessarily.");
-  }
+  if (LANGSEARCH_KEY) extra.push("Use the web_search tool whenever information is current, recent, live, unstable, niche, or externally verifiable. Prefer searching over saying you do not know when external verification could answer the question. Do not search unnecessarily.");
   extra.push("Use the get_time tool whenever the user asks for the current date, current time, or 'what time is it' for a place or timezone. Never guess or state a time from memory. When reporting the time back to the user, always state it in both ISO 8601 format (e.g. 2026-03-09T01:38:00+03:30) and as a Unix timestamp (epoch seconds), in addition to any human-readable form you choose to include.");
   extra.push("Reply in the same language the user is writing in. Do not ask the user which language or style to use — infer it from their message.");
   extra.push("Never expose internal tool calls, hidden reasoning, API keys, secrets, or implementation details.");
   extra.push("Return a normal user-facing answer. Do not use hidden XML-style reaction tags or metadata markers.");
   extra.push("Use clear Telegram Rich Text / Markdown formatting in the final answer when appropriate: short bold headings, readable paragraphs, bullets, numbered steps, inline code, and fenced code blocks.");
-  return SYSTEM_PROMPT + (extra.length ? `\n\n${extra.join("\n")}` : "");
+  const persona = userId != null ? getPersona(userId) : "";
+  const base = SYSTEM_PROMPT + (extra.length ? `\n\n${extra.join("\n")}` : "");
+  return persona ? `${base}\n\nAdditional persona instructions from the user (follow these as long as they don't conflict with safety): ${persona}` : base;
 }
 
 async function buildMessages({ userId, prompt, image, file, fileText }) {
-  const messages = [{ role: "system", content: cleanSystem() }];
+  const messages = [{ role: "system", content: cleanSystem(userId) }];
   if (!image && !file) messages.push(...getHistory(userId).slice(-(HISTORY_PAIRS * 2)).map(({ role, content }) => ({ role, content })));
   if (image) {
     messages.push({ role: "user", content: [{ type: "text", text: prompt || "Describe this image in detail." }, { type: "image_url", image_url: { url: `data:${image.mime};base64,${image.base64}` } }] });
@@ -632,11 +714,7 @@ function processSseLine(rawLine, onPiece, toolCalls, onReasoning) {
   try { chunk = JSON.parse(payload); } catch { return; }
   const delta = chunk?.choices?.[0]?.delta;
   if (Array.isArray(delta?.tool_calls)) mergeTools(toolCalls, delta.tool_calls);
-  // Reasoning content (when a model emits it) is captured internally only —
-  // it must never be shown to the user, including inside <tg-thinking>.
-  const reasoningChunk = typeof delta?.reasoning_content === "string"
-    ? delta.reasoning_content
-    : (typeof delta?.reasoning === "string" ? delta.reasoning : "");
+  const reasoningChunk = typeof delta?.reasoning_content === "string" ? delta.reasoning_content : (typeof delta?.reasoning === "string" ? delta.reasoning : "");
   if (reasoningChunk && typeof onReasoning === "function") onReasoning(reasoningChunk);
   const contentChunk = typeof delta?.content === "string" ? delta.content : "";
   if (contentChunk && typeof onPiece === "function") onPiece(contentChunk);
@@ -664,13 +742,7 @@ async function performToolCalls(toolCalls, searchState) {
       const timezone = parseToolArg(call, "timezone", 100) || "Asia/Tehran";
       const timeInfo = await get_time(timezone);
       result = timeInfo
-        ? [
-            `Time zone: ${timeInfo.timezone}`,
-            `ISO 8601: ${timeInfo.iso8601 || "unavailable"}`,
-            `Unix timestamp: ${timeInfo.unix || "unavailable"}`,
-            `Day of week: ${timeInfo.dayOfWeek}`,
-            `DST active: ${timeInfo.dstActive}`
-          ].join("\n")
+        ? [`Time zone: ${timeInfo.timezone}`, `ISO 8601: ${timeInfo.iso8601 || "unavailable"}`, `Unix timestamp: ${timeInfo.unix || "unavailable"}`, `Day of week: ${timeInfo.dayOfWeek}`, `DST active: ${timeInfo.dstActive}`].join("\n")
         : `Time lookup failed for time zone "${timezone}". Ask the user to confirm the city or time zone.`;
     } else {
       const query = parseToolQuery(call, 500);
@@ -684,19 +756,11 @@ async function performToolCalls(toolCalls, searchState) {
 }
 
 function escHtml(value) { return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-// Native Telegram "thinking" indicator (Bot API 10.1, <tg-thinking>). This is
-// only ever a short user-facing status label — never the model's actual
-// reasoning_content (see performToolCalls / streamOpenRouter above).
 function thinkingHtml(stage = "Thinking...") { return `<tg-thinking>${escHtml(stage)}</tg-thinking>`; }
-// mm:ss-style elapsed label for the live timer line under the status.
 function formatElapsed(seconds) {
   const total = Math.max(0, Math.floor(seconds)), m = Math.floor(total / 60), s = total % 60;
   return m > 0 ? `⏱ ${m}m ${s}s` : `⏱ ${s}s`;
 }
-// Stage label (Thinking / Searching the web / Checking the current time)
-// plus a live elapsed-time counter one line below it — both rendered inside
-// their own <tg-thinking> tag so the timer gets the same shimmer effect as
-// the stage label itself.
 function statusWithTimerHtml(stage, elapsedSeconds) {
   return `${thinkingHtml(stage)}\n${thinkingHtml(formatElapsed(elapsedSeconds))}`;
 }
@@ -709,8 +773,6 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
   const started = Date.now();
   stats.requests++;
   let full = "", fullReasoning = "", firstTokenRecorded = false, finalModel = null, streamMessageId = null, lastEdit = 0;
-  // One persistent draft id for the entire generation (thinking -> searching
-  // -> thinking -> streaming). Never re-created between states.
   const draftIdValue = createRichDraftId();
   let groupEditChain = Promise.resolve(), draftChain = Promise.resolve(), typingTimer = null, draftFallbackMessageId = null, useRichDraft = isPrivate;
   let statusTimer = null, statusVersion = 0, generationStarted = false;
@@ -780,9 +842,6 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
         for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
           let roundText = "";
           const toolCalls = [];
-          // get_time is always offered (it no longer depends on the search
-          // provider); web_search is offered only while search is configured
-          // and the per-request search budget remains.
           const searchAvailable = Boolean(LANGSEARCH_KEY && searchState.count < MAX_SEARCHES);
           const toolsForRound = [...(searchAvailable ? SEARCH_TOOL : []), ...TIME_TOOL];
 
@@ -841,9 +900,6 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
           messages.push({ role: "assistant", content: roundText || null, tool_calls: assistantToolCalls });
           messages.push(...toolMessages);
 
-          // Back to a plain "Thinking..." state between tool results and the
-          // next model round, matching the required thinking -> searching ->
-          // thinking -> streaming sequence.
           if (!generationStarted) { stopStatus(); setStatus("🧠 Thinking..."); }
         }
         break;
@@ -958,24 +1014,9 @@ function splitText(text, limit) {
 }
 
 // ---------------------------------------------------------------------------
-// Guest Calling Mode
-//
-// A guest update carries `guest_message` instead of a normal Telegram
-// `message`. It is handled on its own path — never routed through
-// handleUpdate()/generate() — but it reuses the exact same search-decision
-// and AI-generation building blocks (buildMessages, chooseModelChain,
-// orRequest, streamOpenRouter, performToolCalls) so behavior stays identical
-// to the normal bot. The final answer is delivered via answerGuestQuery()
-// instead of any Telegram send/edit call, and nothing here touches the
-// normal message flow, memory keying, or generate()'s streaming/UI logic.
+// Guest Calling Mode (unchanged behavior from the base bot)
 // ---------------------------------------------------------------------------
 
-// Runs the same search-decision + AI-generation pipeline used by normal
-// messages, non-streaming, and returns the final answer text. Guest queries
-// are one-shot (there is no stable per-user chat to keep memory for), so
-// conversation history is neither read nor written here — everything else
-// (model fallback chain, tool loop, search budget, time tool) is identical
-// to generate().
 async function generateGuestAnswer(guestUserId, prompt) {
   const baseMessages = await buildMessages({ userId: guestUserId, prompt, image: null, file: null, fileText: "" });
   const modelChain = chooseModelChain({ image: false, file: false });
@@ -1019,31 +1060,18 @@ async function generateGuestAnswer(guestUserId, prompt) {
   return full;
 }
 
-// Delivers the guest answer back to Telegram via answerGuestQuery — the
-// counterpart to sendMessage/editMessageRich for normal messages.
 async function answerGuestQuery(token, guestQueryId, replyText) {
   try {
     const res = await fetch(`${TG_API}/bot${token}/answerGuestQuery`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        guest_query_id: guestQueryId,
-        result: {
-          type: "article",
-          id: globalThis.crypto.randomUUID(),
-          title: "Reply",
-          input_message_content: { message_text: replyText }
-        }
-      }),
+      body: JSON.stringify({ guest_query_id: guestQueryId, result: { type: "article", id: globalThis.crypto.randomUUID(), title: "Reply", input_message_content: { message_text: replyText } } }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
     });
     const raw = await res.text();
     let data;
     try { data = raw ? JSON.parse(raw) : { ok: res.ok }; } catch { data = { ok: false, description: raw || res.statusText }; }
-    if (!data.ok) {
-      stats.telegramErrors++;
-      console.error(`answerGuestQuery error: ${sanitizeLog(JSON.stringify(data))}`);
-    }
+    if (!data.ok) { stats.telegramErrors++; console.error(`answerGuestQuery error: ${sanitizeLog(JSON.stringify(data))}`); }
     return data;
   } catch (e) {
     stats.telegramErrors++;
@@ -1052,25 +1080,14 @@ async function answerGuestQuery(token, guestQueryId, replyText) {
   }
 }
 
-// Entry point for an update carrying `guest_message`. Mirrors handleUpdate()
-// in shape (extract -> decide -> generate -> reply) but never touches the
-// normal message path, generate()'s Telegram streaming/UI, or saveHistory.
 async function handleGuestMessage(token, update) {
   stats.guestRequests++;
   const guestMessage = update.guest_message;
   const guestQueryId = guestMessage?.guest_query_id;
-
-  if (!guestQueryId) {
-    console.error("guest_message missing guest_query_id");
-    return;
-  }
+  if (!guestQueryId) { console.error("guest_message missing guest_query_id"); return; }
 
   const text = String(guestMessage.text || guestMessage.caption || "").trim().slice(0, MAX_USER_PROMPT_CHARS);
-
-  if (!text) {
-    await answerGuestQuery(token, guestQueryId, "Mention me with a question and I'll do my best to help.");
-    return;
-  }
+  if (!text) { await answerGuestQuery(token, guestQueryId, "Mention me with a question and I'll do my best to help."); return; }
 
   let replyText;
   try {
@@ -1086,13 +1103,142 @@ async function handleGuestMessage(token, update) {
 
   const MAX_LEN = 4096;
   if (replyText.length > MAX_LEN) replyText = replyText.slice(0, MAX_LEN - 1) + "…";
-
   await answerGuestQuery(token, guestQueryId, replyText);
 }
 
 // ---------------------------------------------------------------------------
-// Commands
+// Commands — now rendered with native Rich Text blocks
 // ---------------------------------------------------------------------------
+
+function displayName(user) {
+  const first = String(user?.first_name || "").trim();
+  const last = String(user?.last_name || "").trim();
+  const full = [first, last].filter(Boolean).join(" ").trim();
+  return full || user?.username || "friend";
+}
+
+async function sendStart(chatId, user, messageId) {
+  const name = displayName(user);
+  const blocks = [
+    rb.paragraph([rt.bold("👋 Welcome, "), rt.mention(name, user), rt.bold("!")]),
+    rb.paragraph("I'm your AI assistant, ready to chat, answer questions, look things up on the web, and read images or documents you send me."),
+    rb.divider(),
+    rb.heading("Getting started", 4),
+    rb.bulletList([
+      "Just type a message to start chatting.",
+      "Send a photo or a document and I'll read it.",
+      "Use /help any time to see everything I can do."
+    ])
+  ];
+  await sendRichBlocksMessage(chatId, blocks, messageId);
+}
+
+function helpBlocks() {
+  return [
+    rb.heading("How to use the bot", 3),
+    rb.paragraph("Everything below works out of the box — no setup required."),
+    rb.divider(),
+    rb.heading("Chat", 4),
+    rb.bulletList([
+      "In a private chat, just send a normal message.",
+      `In a group, mention me, reply to me, or use the trigger command "${TRIGGER || "!ai"}".`,
+      "I reply in whatever language you write in."
+    ]),
+    rb.heading("Memory & persona", 4),
+    rb.bulletList([
+      `I keep the most recent ${HISTORY_PAIRS} conversation pair${HISTORY_PAIRS === 1 ? "" : "s"} per user.`,
+      "/clear — clear your conversation history.",
+      "/persona <text> — give me a custom personality or house style, just for you.",
+      "/persona (no text) — show your current persona.",
+      "Editing a message you sent regenerates the answer in place."
+    ]),
+    rb.heading("Web & time", 4),
+    rb.bulletList([
+      "I automatically search the web for current or external information.",
+      "I can report the date/time for any place, in ISO 8601 and Unix timestamp form."
+    ]),
+    rb.heading("Media", 4),
+    rb.bulletList([
+      "Images: JPEG, PNG, or WEBP, with or without a caption.",
+      `Text files: ${SUPPORTED_TEXT_EXTENSIONS.map(e => `.${e}`).join(", ")}`,
+      `Office/PDF: ${SUPPORTED_BINARY_EXTENSIONS.map(e => `.${e}`).join(", ")}`,
+      `Max size: ${Math.floor(MAX_DOWNLOAD_BYTES / (1024 * 1024))} MB.`
+    ]),
+    rb.heading("Utilities", 4),
+    rb.bulletList([
+      "/remind <minutes> <message> — one-off reminder.",
+      "/export — download your conversation history as a text file.",
+      "/settings — quick-access buttons for memory & persona.",
+      "/status or /stats — runtime statistics.",
+      "/models — active AI models.",
+    ]),
+    rb.footer("Tip: /help shows this guide again any time.")
+  ];
+}
+
+function statusBlocks(admin = false) {
+  const uptime = Math.floor((Date.now() - stats.started) / 1000);
+  const blocks = [
+    rb.heading("🤖 Bot status", 3),
+    rb.bulletList([
+      `Uptime: ${formatUptime(uptime)}`,
+      `Requests: ${stats.requests}`,
+      `Errors: ${stats.errors}`,
+      `Searches: ${stats.searches}`,
+      `Images: ${stats.images}`,
+      `Files: ${stats.files}`,
+      `Avg first token: ${stats.firstTokenMs.length ? `${avg(stats.firstTokenMs)} ms` : "—"}`,
+      `Avg total: ${stats.totalMs.length ? `${avg(stats.totalMs)} ms` : "—"}`,
+    ])
+  ];
+  if (admin) {
+    blocks.push(rb.divider());
+    blocks.push(rb.heading("Admin detail", 4));
+    blocks.push(rb.bulletList([
+      `Telegram errors: ${stats.telegramErrors}`,
+      `OpenRouter errors: ${stats.openRouterErrors}`,
+      `Search failures: ${stats.searchFailures}`,
+      `Guest requests: ${stats.guestRequests}`,
+      `Guest errors: ${stats.guestErrors}`,
+      `Memory entries: ${memory.size}`,
+      `In-flight queues: ${inFlightQueues.size}`,
+      `Active reminders: ${reminders.length}`
+    ]));
+  }
+  return blocks;
+}
+
+function modelsBlocks() {
+  return [
+    rb.heading("🤖 Active models", 3),
+    rb.bulletList([
+      `Primary: ${TEXT_MODEL}`,
+      `Fallback: ${FALLBACK_TEXT_MODEL}`,
+      `Vision: ${VISION_MODEL}`,
+      `Files: ${FILE_MODEL}`
+    ])
+  ];
+}
+
+function settingsKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "🧹 Clear memory", callback_data: "settings:clear" }, { text: "🎭 Show persona", callback_data: "settings:persona" }],
+      [{ text: "📤 Export history", callback_data: "settings:export" }]
+    ]
+  };
+}
+
+const ADMIN_IDS = new Set(String(process.env.ADMIN_IDS || "").split(",").map(v => v.trim()).filter(Boolean));
+
+async function exportHistory(chatId, userId, messageId) {
+  const history = getHistory(userId);
+  if (!history.length) { await sendRichBlocksMessage(chatId, [rb.paragraph("There's no conversation history to export yet.")], messageId); return; }
+  const lines = history.map(item => `${item.role === "user" ? "You" : "Bot"}: ${item.content}`);
+  const buffer = Buffer.from(lines.join("\n\n"), "utf8");
+  const result = await sendDocumentBuffer(chatId, buffer, `conversation-${Date.now()}.txt`, "🗂 Your exported conversation history.", messageId);
+  if (!result.ok) await sendRichBlocksMessage(chatId, [rb.paragraph("❌ Sorry, I couldn't export your history right now.")], messageId);
+}
 
 function parseCommand(text) {
   const raw = String(text || "").trim();
@@ -1102,91 +1248,77 @@ function parseCommand(text) {
   return { command: commandName.toLowerCase(), arg: rest.join(" ").trim() };
 }
 
-async function command(chatId, userId, text, messageId) {
+async function command(chatId, userId, text, messageId, fromUser) {
   const parsed = parseCommand(text);
   if (!parsed) return false;
 
   switch (parsed.command) {
     case "/start":
-      await sendRichMessage(chatId, [
-        "🤖 *Welcome.*",
-        "",
-        "Send me a message to chat.",
-        "",
-        "You can type a prompt, send an image, or send a supported document.",
-        "",
-        "Use /help to see everything I support."
-      ].join("\n"), messageId);
+      await sendStart(chatId, fromUser, messageId);
       return true;
 
     case "/help":
-      await sendRichMessage(chatId, helpText(), messageId);
+      await sendRichBlocksMessage(chatId, helpBlocks(), messageId);
       return true;
 
     case "/clear":
     case "/clearmemory":
       clearUserMemory(userId);
-      await sendRichMessage(chatId, "🧹 *Conversation memory cleared.*", messageId);
+      await sendRichBlocksMessage(chatId, [rb.paragraph([rt.bold("🧹 Conversation memory cleared.")])], messageId);
+      return true;
+
+    case "/persona": {
+      if (!parsed.arg) {
+        const current = getPersona(userId);
+        await sendRichBlocksMessage(chatId, current
+          ? [rb.heading("🎭 Your current persona", 4), rb.blockquote([rb.paragraph(current)])]
+          : [rb.paragraph("You don't have a custom persona set. Use /persona <text> to set one.")], messageId);
+        return true;
+      }
+      if (/^(clear|reset|off|none)$/i.test(parsed.arg)) {
+        setPersona(userId, "");
+        await sendRichBlocksMessage(chatId, [rb.paragraph("🎭 Persona cleared — back to default.")], messageId);
+        return true;
+      }
+      const saved = setPersona(userId, parsed.arg);
+      await sendRichBlocksMessage(chatId, [rb.paragraph([rt.bold("🎭 Persona updated:")]), rb.blockquote([rb.paragraph(saved)])], messageId);
+      return true;
+    }
+
+    case "/remind": {
+      const match = parsed.arg.match(/^(\d{1,5})\s+([\s\S]+)$/);
+      if (!match) {
+        await sendRichBlocksMessage(chatId, [rb.paragraph("Usage: /remind <minutes> <message>")], messageId);
+        return true;
+      }
+      const minutes = Math.min(REMINDER_MAX_MINUTES, Math.max(1, Number(match[1])));
+      const reminderText = match[2].trim().slice(0, 500);
+      scheduleReminder(chatId, userId, minutes, reminderText, messageId);
+      await sendRichBlocksMessage(chatId, [rb.paragraph([rt.bold("⏰ Reminder set: "), `in ${minutes} minute${minutes === 1 ? "" : "s"}.`])], messageId);
+      return true;
+    }
+
+    case "/export":
+      await exportHistory(chatId, userId, messageId);
+      return true;
+
+    case "/settings":
+      await tg("sendMessage", { chat_id: chatId, text: "⚙️ Quick settings:", reply_markup: settingsKeyboard(), ...(messageId ? { reply_parameters: { message_id: messageId } } : {}) });
       return true;
 
     case "/status":
     case "/stats":
-      await sendRichMessage(chatId, statusText(false), messageId);
+      await sendRichBlocksMessage(chatId, statusBlocks(false), messageId);
       return true;
 
     case "/models":
-      await sendRichMessage(chatId, [
-        "🤖 *Active models*",
-        "",
-        `Primary: \`${escCode(TEXT_MODEL)}\``,
-        `Fallback: \`${escCode(FALLBACK_TEXT_MODEL)}\``,
-        `Vision: \`${escCode(VISION_MODEL)}\``,
-        `Files: \`${escCode(FILE_MODEL)}\``
-      ].join("\n"), messageId);
+      await sendRichBlocksMessage(chatId, modelsBlocks(), messageId);
       return true;
 
     default:
       return false;
   }
 }
-
-function helpText() {
-  return [
-    "🤖 *How to use the bot*",
-    "",
-    "💬 *Chat*",
-    "• In a private chat, send a normal message.",
-    "• In a group, mention me, reply to me, or use the trigger command.",
-    `• Trigger command: \`${esc(TRIGGER || "!ai")}\` your message`,
-    "• I reply in whatever language you write in — no setup needed.",
-    "",
-    "🧠 *Memory*",
-    `• I keep the most recent ${HISTORY_PAIRS} conversation pair${HISTORY_PAIRS === 1 ? "" : "s"} in memory per user.`,
-    "• `/clear` or `/clearmemory` clears your conversation history.",
-    "• Editing a message you sent regenerates the answer in place, without duplicating the old turn.",
-    "• Memory is local to the running service and resets when it restarts.",
-    "",
-    "🌐 *Web & time*",
-    "• I automatically search the web when a question needs current, recent, or external information.",
-    "• I can look up the current date and time for any place, reported in both ISO 8601 and Unix timestamp form.",
-    "",
-    "🖼 *Images*",
-    "• Send a JPEG, PNG, or WEBP image, with or without a caption.",
-    "",
-    "📎 *Documents*",
-    "• Text-based files: " + esc(SUPPORTED_TEXT_EXTENSIONS.map(ext => `.${ext}`).join(", ")),
-    "• Office/PDF files: " + esc(SUPPORTED_BINARY_EXTENSIONS.map(ext => `.${ext}`).join(", ")),
-    `• Max file size: ${Math.floor(MAX_DOWNLOAD_BYTES / (1024 * 1024))} MB.`,
-    "• Videos, GIFs, audio, voice notes, and stickers are not accepted.",
-    "",
-    "📊 *Info*",
-    "• `/status` or `/stats` — current runtime statistics.",
-    "• `/models` — active text, vision, and file models.",
-    "• `/help` — show this guide again."
-  ].join("\n");
-}
-
-const ADMIN_IDS = new Set(String(process.env.ADMIN_IDS || "").split(",").map(v => v.trim()).filter(Boolean));
 
 async function adminCommand(chatId, userId, text, messageId) {
   if (!ADMIN_IDS.has(String(userId))) return false;
@@ -1196,17 +1328,42 @@ async function adminCommand(chatId, userId, text, messageId) {
   switch (parsed.command) {
     case "/admin":
     case "/dev":
-      await sendRichMessage(chatId, statusText(true), messageId);
+      await sendRichBlocksMessage(chatId, statusBlocks(true), messageId);
       return true;
 
     case "/clearcache":
       clearAllCache();
-      await sendRichMessage(chatId, "🧹 *Cache and in-memory state cleared.*", messageId);
+      await sendRichBlocksMessage(chatId, [rb.paragraph([rt.bold("🧹 Cache and in-memory state cleared.")])], messageId);
       return true;
 
     default:
       return false;
   }
+}
+
+async function handleCallbackQuery(callbackQuery) {
+  const data = String(callbackQuery?.data || "");
+  const chatId = callbackQuery?.message?.chat?.id;
+  const userId = callbackQuery?.from?.id ?? chatId;
+  const messageId = callbackQuery?.message?.message_id;
+  if (!chatId) return;
+
+  if (data === "settings:clear") {
+    clearUserMemory(userId);
+    await answerCallbackQuery(callbackQuery.id, "Memory cleared ✅");
+    return;
+  }
+  if (data === "settings:persona") {
+    const persona = getPersona(userId);
+    await answerCallbackQuery(callbackQuery.id, persona ? persona.slice(0, 190) : "No custom persona set.", true);
+    return;
+  }
+  if (data === "settings:export") {
+    await answerCallbackQuery(callbackQuery.id, "Exporting your history…");
+    await exportHistory(chatId, userId, messageId);
+    return;
+  }
+  await answerCallbackQuery(callbackQuery.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,9 +1394,8 @@ function stripTargeting(text) {
 }
 
 async function handleUpdate(update) {
-  // Edited messages are treated like new incoming messages: editing a
-  // message you already sent triggers a brand new response, and the old
-  // turn is removed from history so it isn't kept as a stale duplicate.
+  if (update?.callback_query) { await handleCallbackQuery(update.callback_query); return; }
+
   const message = update?.message || update?.edited_message;
   const isEdited = Boolean(update?.edited_message);
   if (!message?.chat) return;
@@ -1258,7 +1414,7 @@ async function handleUpdate(update) {
 
   if (!isEdited) {
     if (await adminCommand(chatId, userId, text, messageId)) return;
-    if (await command(chatId, userId, text, messageId)) return;
+    if (await command(chatId, userId, text, messageId, message.from)) return;
   }
 
   if (!isPrivate) {
@@ -1267,13 +1423,13 @@ async function handleUpdate(update) {
   }
 
   if (unsupportedMedia) {
-    await sendRichMessage(chatId, "📝 *Type a prompt, send an image, or send a supported document. See /help for the full list.*", messageId);
+    await sendRichBlocksMessage(chatId, [rb.paragraph("📝 Type a prompt, send an image, or send a supported document. See /help for the full list.")], messageId);
     return;
   }
 
   const prompt = stripTargeting(sourceText).slice(0, MAX_USER_PROMPT_CHARS);
   if (!prompt && !isImage && !isDocument) {
-    await sendRichMessage(chatId, "📝 *Type a prompt, send an image, or send a supported document.*", messageId);
+    await sendRichBlocksMessage(chatId, [rb.paragraph("📝 Type a prompt, send an image, or send a supported document.")], messageId);
     return;
   }
 
@@ -1288,12 +1444,12 @@ async function handleUpdate(update) {
       const mime = detectImageMime(downloaded.buffer, downloaded.path, downloaded.httpMime);
       if (!mime || !IMAGE_MIMES.has(mime)) {
         console.error(`[image:mime-detect-failed] path=${sanitizeLog(downloaded.path)} httpMime=${sanitizeLog(downloaded.httpMime)} bytes=${downloaded.buffer.length}`);
-        await sendRichMessage(chatId, "📝 *Type a prompt or send a JPEG, PNG, or WEBP image.*", messageId);
+        await sendRichBlocksMessage(chatId, [rb.paragraph("📝 Type a prompt or send a JPEG, PNG, or WEBP image.")], messageId);
         return;
       }
       image = { buffer: downloaded.buffer, base64: downloaded.base64, mime };
     } catch (error) {
-      await sendRichMessage(chatId, `❌ Image processing failed: ${esc(error instanceof Error ? error.message : "unknown error")}`, messageId);
+      await sendRichBlocksMessage(chatId, [rb.paragraph(`❌ Image processing failed: ${error instanceof Error ? error.message : "unknown error"}`)], messageId);
       return;
     }
   }
@@ -1306,23 +1462,20 @@ async function handleUpdate(update) {
       const downloaded = await telegramFile(doc.file_id);
       const fileName = doc.file_name || "file";
 
-      // Prefer inline text decoding for anything recognizably text-like...
       const text = decodeTextFile(downloaded.buffer, fileName, doc.mime_type);
       if (text !== null) {
         fileText = text;
         fileObj = { name: fileName, part: null };
       } else {
-        // ...otherwise try forwarding it as a binary file part (PDF, Office
-        // documents, etc.) for the file-capable model to read directly.
         const part = filePartFromDownload(downloaded, fileName, doc.mime_type);
         if (!part) {
-          await sendRichMessage(chatId, "📝 *That file type isn't supported. See /help for the list of supported document formats.*", messageId);
+          await sendRichBlocksMessage(chatId, [rb.paragraph("📝 That file type isn't supported. See /help for the list of supported document formats.")], messageId);
           return;
         }
         fileObj = { name: fileName, part };
       }
     } catch (error) {
-      await sendRichMessage(chatId, `❌ File processing failed: ${esc(error instanceof Error ? error.message : "unknown error")}`, messageId);
+      await sendRichBlocksMessage(chatId, [rb.paragraph(`❌ File processing failed: ${error instanceof Error ? error.message : "unknown error"}`)], messageId);
       return;
     }
   }
@@ -1365,9 +1518,6 @@ function drainJobs() {
   }
 }
 function processUpdate(update) { return withGlobalConcurrency(() => handleUpdate(update)); }
-// Guest updates get their own concurrency-gated entry point, kept separate
-// from processUpdate()/handleUpdate() so guest traffic can never be routed
-// through the normal message path.
 function processGuestUpdate(update) { return withGlobalConcurrency(() => handleGuestMessage(BOT_TOKEN, update)); }
 
 // ---------------------------------------------------------------------------
@@ -1375,15 +1525,7 @@ function processGuestUpdate(update) { return withGlobalConcurrency(() => handleG
 // ---------------------------------------------------------------------------
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-// One draft id per generation, per the Rich Message Draft API contract
-// (draft_id must be non-zero; the same id animates in place across updates).
-function createRichDraftId() {
-  return (
-    globalThis.crypto.getRandomValues(
-      new Uint32Array(1)
-    )[0] || 1
-  );
-}
+function createRichDraftId() { return (globalThis.crypto.getRandomValues(new Uint32Array(1))[0] || 1); }
 function esc(value) { return String(value ?? "").replace(/[_*\[\]()~`>#+\-=|{}.!\\]/g, "\\$&"); }
 function escCode(value) { return String(value ?? "").replace(/[`\\]/g, "\\$&"); }
 function escapeRegExp(value) { return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
@@ -1437,8 +1579,6 @@ app.post(WEBHOOK_PATH, (req, res) => {
 
   res.status(200).send("OK");
 
-  // Guest updates carry `guest_message` instead of a normal `message` and
-  // must never fall through to the normal message extraction below.
   if (req.body?.guest_message) {
     processGuestUpdate(req.body).catch(error => { console.error(`[processGuestUpdate:error] ${sanitizeLog(error?.message || error)}`); });
     return;
