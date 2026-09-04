@@ -24,6 +24,15 @@ import express from "express";
 //     dedicated buildRichBlocksMessage() send helper with automatic HTML
 //     fallback, and clearer separation between "system" extras and the
 //     per-user persona addendum.
+//  6. "Thinking" status bubble now shows the stage label on its own line and
+//     the running timer on the line below it (no more "Thinking... · 3s"),
+//     and the trailing "..." was dropped from the stage labels.
+//  7. The server terminal now logs, plainly and separately from anything
+//     sent to the chat, exactly which OpenRouter model is being used for
+//     each request/attempt — see the "[model-used]" log lines.
+//  8. SYSTEM_PROMPT is documented below as the way to set a custom default
+//     persona/role for the bot via an environment variable (see the comment
+//     next to its definition).
 // ============================================================================
 
 const TG_API = "https://api.telegram.org",
@@ -40,6 +49,24 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "",
   LANGSEARCH_KEY = process.env.LANGSEARCH_API_KEY || "",
   BOT_USERNAME = String(process.env.BOT_USERNAME || "").replace(/^@/, ""),
   TRIGGER = String(process.env.TRIGGER_COMMAND || "!ai").trim(),
+  // ---------------------------------------------------------------------
+  // SYSTEM_PROMPT — this IS the "custom default role" env var.
+  // Set it in your hosting platform's environment variables (Render,
+  // Railway, Docker, .env file, etc.) to change the bot's base persona
+  // for every user, e.g.:
+  //
+  //   SYSTEM_PROMPT="You are a senior, meticulous research and coding
+  //   assistant. Prioritize accuracy over speed: verify claims, state
+  //   uncertainty explicitly instead of guessing, show your reasoning
+  //   for non-trivial answers, and give complete, well-structured,
+  //   directly usable answers (working code, concrete steps, exact
+  //   numbers) rather than vague overviews. Ask a clarifying question
+  //   only when the request is genuinely ambiguous; otherwise make the
+  //   most reasonable assumption, state it briefly, and proceed."
+  //
+  // This is separate from /persona, which lets an individual user layer
+  // extra instructions on top of this base prompt (see cleanSystem()).
+  // ---------------------------------------------------------------------
   SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "You are a helpful AI assistant. Answer accurately, clearly, naturally, and concisely.",
   PRIMARY_TEXT_MODEL = process.env.OPENROUTER_MODEL || "z-ai/glm-5.2:free",
   FALLBACK_TEXT_MODEL = process.env.OPENROUTER_MODEL_FALLBACK || "minimax/minimax-m2.7:free",
@@ -776,16 +803,17 @@ async function performToolCalls(toolCalls, searchState) {
 }
 
 function escHtml(value) { return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-function thinkingHtml(stage = "Thinking...") { return `<tg-thinking>${escHtml(stage)}</tg-thinking>`; }
+function thinkingHtml(stage = "Thinking") { return `<tg-thinking>${escHtml(stage)}</tg-thinking>`; }
 function formatElapsed(seconds) {
   const total = Math.max(0, Math.floor(seconds)), m = Math.floor(total / 60), s = total % 60;
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
-// One <tg-thinking> element = one bubble. Two separate blocks (label + timer)
-// render as two stacked bubbles, which looks broken — merge into a single
-// line instead: "Thinking… · 3s".
+// One <tg-thinking> element = one bubble, but a line break inside it renders
+// fine — so the stage label goes on its own line and the running timer goes
+// on the line right below it (no more "Thinking... · 3s" on one line, and no
+// trailing "..." on the label — it reads cleaner).
 function statusWithTimerHtml(stage, elapsedSeconds) {
-  return thinkingHtml(`${stage} · ${formatElapsed(elapsedSeconds)}`);
+  return `<tg-thinking>${escHtml(stage)}<br>${escHtml(formatElapsed(elapsedSeconds))}</tg-thinking>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -830,23 +858,23 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
     const modelChain = chooseModelChain({ image: Boolean(image), file: Boolean(file) });
     if (image) await ensureImageModel(modelChain[0]);
 
-    console.log(`[request] models=${sanitizeLog(modelChain.join(" -> "))} image=${Boolean(image)} file=${Boolean(file)}`);
+    console.log(`[request] chat=${chatId} user=${userId} models=${sanitizeLog(modelChain.join(" -> "))} image=${Boolean(image)} file=${Boolean(file)}`);
 
     if (!isPrivate) {
-      const placeholder = await sendRichMessage(chatId, thinkingHtml("Thinking..."), replyTo);
+      const placeholder = await sendRichMessage(chatId, thinkingHtml("Thinking"), replyTo);
       if (!placeholder?.ok || !placeholder?.result?.message_id) throw new Error("Could not create the Telegram streaming message.");
       streamMessageId = placeholder.result.message_id;
     } else {
       draftChain = draftChain.then(async () => {
-        const result = await sendRichMessageDraftHtml(chatId, draftIdValue, thinkingHtml("Thinking..."));
+        const result = await sendRichMessageDraftHtml(chatId, draftIdValue, thinkingHtml("Thinking"));
         if (result.ok) return;
         useRichDraft = false;
-        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("Thinking..."), replyTo);
+        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("Thinking"), replyTo);
         if (fallback?.ok) draftFallbackMessageId = fallback.result?.message_id || null;
       });
     }
 
-    setStatus("Thinking...");
+    setStatus("Thinking");
     typingTimer = setInterval(() => typing(chatId).catch(() => {}), TYPING_MS);
     typingTimer.unref?.();
 
@@ -855,6 +883,10 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
 
     for (let mi = 0; mi < modelChain.length; mi++) {
       finalModel = modelChain[mi];
+      // --- Terminal-only log: which model is actively being used for this
+      // request/attempt. This is printed to the server console (stdout),
+      // never sent to the chat.
+      console.log(`[model-used] chat=${chatId} user=${userId} model=${finalModel} attempt=${mi + 1}/${modelChain.length}`);
       messages = baseMessages.slice();
       full = "";
       fullReasoning = "";
@@ -891,7 +923,7 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
                     if (!richResult.ok) {
                       useRichDraft = false;
                       if (!draftFallbackMessageId) {
-                        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("Thinking..."), replyTo);
+                        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("Thinking"), replyTo);
                         if (fallback?.ok) draftFallbackMessageId = fallback.result?.message_id || null;
                       }
                     }
@@ -914,16 +946,16 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
             const hasSearch = validTools.some(call => call?.function?.name === "web_search");
             const hasTime = validTools.some(call => call?.function?.name === "get_time");
             stopStatus();
-            if (hasSearch) setStatus("Searching the web...");
-            else if (hasTime) setStatus("Checking the current time...");
-            else setStatus("Thinking...");
+            if (hasSearch) setStatus("Searching the web");
+            else if (hasTime) setStatus("Checking the current time");
+            else setStatus("Thinking");
           }
 
           const { assistantToolCalls, toolMessages } = await performToolCalls(validTools, searchState);
           messages.push({ role: "assistant", content: roundText || null, tool_calls: assistantToolCalls });
           messages.push(...toolMessages);
 
-          if (!generationStarted) { stopStatus(); setStatus("Thinking..."); }
+          if (!generationStarted) { stopStatus(); setStatus("Thinking"); }
         }
         break;
       } catch (error) {
@@ -957,7 +989,7 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
     pushMetric(stats.totalMs, Date.now() - started);
     saveHistory(userId, prompt, full, messageId);
 
-    console.log(`[complete] model=${sanitizeLog(finalModel)} chars=${full.length} total_ms=${Date.now() - started} searches=${searchState.count}`);
+    console.log(`[complete] chat=${chatId} user=${userId} model=${finalModel} chars=${full.length} total_ms=${Date.now() - started} searches=${searchState.count}`);
     return full;
 
   } catch (error) {
@@ -968,7 +1000,7 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
     await Promise.allSettled([groupEditChain, draftChain]);
 
     const publicMessage = userFacingError(error);
-    console.error(`[generate:error] model=${sanitizeLog(finalModel || "unknown")} status=${error?.status || "n/a"} message=${sanitizeLog(error?.message || error)}`);
+    console.error(`[generate:error] chat=${chatId} user=${userId} model=${sanitizeLog(finalModel || "unknown")} status=${error?.status || "n/a"} message=${sanitizeLog(error?.message || error)}`);
 
     try {
       if (!full.trim()) {
@@ -1048,6 +1080,7 @@ async function generateGuestAnswer(guestUserId, prompt) {
 
   for (let mi = 0; mi < modelChain.length; mi++) {
     finalModel = modelChain[mi];
+    console.log(`[model-used][guest] user=${guestUserId} model=${finalModel} attempt=${mi + 1}/${modelChain.length}`);
     let messages = baseMessages.slice();
     full = "";
     searchState.count = 0;
