@@ -759,10 +759,13 @@ function escHtml(value) { return String(value ?? "").replace(/&/g, "&amp;").repl
 function thinkingHtml(stage = "Thinking...") { return `<tg-thinking>${escHtml(stage)}</tg-thinking>`; }
 function formatElapsed(seconds) {
   const total = Math.max(0, Math.floor(seconds)), m = Math.floor(total / 60), s = total % 60;
-  return m > 0 ? `⏱ ${m}m ${s}s` : `⏱ ${s}s`;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
+// One <tg-thinking> element = one bubble. Two separate blocks (label + timer)
+// render as two stacked bubbles, which looks broken — merge into a single
+// line instead: "Thinking… · 3s".
 function statusWithTimerHtml(stage, elapsedSeconds) {
-  return `${thinkingHtml(stage)}\n${thinkingHtml(formatElapsed(elapsedSeconds))}`;
+  return thinkingHtml(`${stage} · ${formatElapsed(elapsedSeconds)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -810,20 +813,20 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
     console.log(`[request] models=${sanitizeLog(modelChain.join(" -> "))} image=${Boolean(image)} file=${Boolean(file)}`);
 
     if (!isPrivate) {
-      const placeholder = await sendRichMessage(chatId, thinkingHtml("🧠 Thinking..."), replyTo);
+      const placeholder = await sendRichMessage(chatId, thinkingHtml("Thinking..."), replyTo);
       if (!placeholder?.ok || !placeholder?.result?.message_id) throw new Error("Could not create the Telegram streaming message.");
       streamMessageId = placeholder.result.message_id;
     } else {
       draftChain = draftChain.then(async () => {
-        const result = await sendRichMessageDraftHtml(chatId, draftIdValue, thinkingHtml("🧠 Thinking..."));
+        const result = await sendRichMessageDraftHtml(chatId, draftIdValue, thinkingHtml("Thinking..."));
         if (result.ok) return;
         useRichDraft = false;
-        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("🧠 Thinking..."), replyTo);
+        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("Thinking..."), replyTo);
         if (fallback?.ok) draftFallbackMessageId = fallback.result?.message_id || null;
       });
     }
 
-    setStatus("🧠 Thinking...");
+    setStatus("Thinking...");
     typingTimer = setInterval(() => typing(chatId).catch(() => {}), TYPING_MS);
     typingTimer.unref?.();
 
@@ -868,7 +871,7 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
                     if (!richResult.ok) {
                       useRichDraft = false;
                       if (!draftFallbackMessageId) {
-                        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("🧠 Thinking..."), replyTo);
+                        const fallback = await sendRichMessageHtml(chatId, thinkingHtml("Thinking..."), replyTo);
                         if (fallback?.ok) draftFallbackMessageId = fallback.result?.message_id || null;
                       }
                     }
@@ -891,16 +894,16 @@ async function generate({ chatId, userId, prompt, image, file, fileText, replyTo
             const hasSearch = validTools.some(call => call?.function?.name === "web_search");
             const hasTime = validTools.some(call => call?.function?.name === "get_time");
             stopStatus();
-            if (hasSearch) setStatus("🔎 Searching the web...");
-            else if (hasTime) setStatus("🕐 Checking the current time...");
-            else setStatus("🧠 Thinking...");
+            if (hasSearch) setStatus("Searching the web...");
+            else if (hasTime) setStatus("Checking the current time...");
+            else setStatus("Thinking...");
           }
 
           const { assistantToolCalls, toolMessages } = await performToolCalls(validTools, searchState);
           messages.push({ role: "assistant", content: roundText || null, tool_calls: assistantToolCalls });
           messages.push(...toolMessages);
 
-          if (!generationStarted) { stopStatus(); setStatus("🧠 Thinking..."); }
+          if (!generationStarted) { stopStatus(); setStatus("Thinking..."); }
         }
         break;
       } catch (error) {
