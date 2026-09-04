@@ -43,10 +43,30 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "",
   SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "You are a helpful AI assistant. Answer accurately, clearly, naturally, and concisely.",
   PRIMARY_TEXT_MODEL = process.env.OPENROUTER_MODEL || "z-ai/glm-5.2:free",
   FALLBACK_TEXT_MODEL = process.env.OPENROUTER_MODEL_FALLBACK || "minimax/minimax-m2.7:free",
-  TEXT_MODEL = PRIMARY_TEXT_MODEL,
   VISION_MODEL = process.env.OPENROUTER_VISION_MODEL || "openrouter/free",
   FILE_MODEL = process.env.OPENROUTER_FILE_MODEL || "openrouter/free",
   PORT = Number(process.env.PORT || 3000);
+
+// ---------------------------------------------------------------------------
+// Free-model catalog + the currently active main (primary) model.
+// TEXT_MODEL is intentionally mutable — /models lets an admin switch the bot's
+// main text model at runtime without a redeploy. It resets to PRIMARY_TEXT_MODEL
+// on restart since it's kept in memory only, matching the rest of this file's
+// "in-memory, best-effort" state (reminders, per-user history, etc.).
+const FREE_MODELS = [
+  { id: "z-ai/glm-5.2:free", label: "GLM 5.2" },
+  { id: "minimax/minimax-m2.7:free", label: "MiniMax M2.7" },
+  { id: "inclusionai/ling-3.0-flash-fin:free", label: "Ling 3.0 Flash Fin" },
+  { id: "deepseek/deepseek-chat-v3.1:free", label: "DeepSeek Chat v3.1" },
+  { id: "qwen/qwen3-235b-a22b:free", label: "Qwen3 235B" },
+  { id: "meta-llama/llama-3.3-70b-instruct:free", label: "Llama 3.3 70B" },
+  { id: "google/gemini-2.0-flash-exp:free", label: "Gemini 2.0 Flash" },
+  { id: "openrouter/free", label: "OpenRouter Auto (free)" }
+];
+// De-dupe in case PRIMARY_TEXT_MODEL/FALLBACK_TEXT_MODEL from env already match an entry above.
+if (!FREE_MODELS.some(m => m.id === PRIMARY_TEXT_MODEL)) FREE_MODELS.unshift({ id: PRIMARY_TEXT_MODEL, label: PRIMARY_TEXT_MODEL });
+
+let TEXT_MODEL = PRIMARY_TEXT_MODEL;
 
 function clampInt(value, fallback, min, max) {
   const n = Number(value);
@@ -1173,7 +1193,7 @@ function helpBlocks() {
       "/export — download your conversation history as a text file.",
       "/settings — quick-access buttons for memory & persona.",
       "/status or /stats — runtime statistics.",
-      "/models — active AI models.",
+      "/models — active AI models, and switch the primary one.",
     ]),
     rb.footer("Tip: /help shows this guide again any time.")
   ];
@@ -1211,7 +1231,7 @@ function statusBlocks(admin = false) {
   return blocks;
 }
 
-function modelsBlocks() {
+function modelsBlocks(canChange) {
   return [
     rb.heading("🤖 Active models", 3),
     rb.bulletList([
@@ -1219,8 +1239,22 @@ function modelsBlocks() {
       `Fallback: ${FALLBACK_TEXT_MODEL}`,
       `Vision: ${VISION_MODEL}`,
       `Files: ${FILE_MODEL}`
-    ])
+    ]),
+    rb.paragraph(canChange ? "Tap a model below to make it the primary model." : "Only admins can change the primary model.")
   ];
+}
+
+// "Glassy" pill-style inline keyboard: a translucent-looking frame (◇/✦) around
+// each label, one model per row, with the active model marked and disabled
+// (re-tapping the current model is a no-op, so we grey it out instead).
+function modelsKeyboard() {
+  return {
+    inline_keyboard: FREE_MODELS.map((model, index) => {
+      const active = model.id === TEXT_MODEL;
+      const label = active ? `✅ ✦ ${model.label} ✦` : `◇ ${model.label} ◇`;
+      return [{ text: label, callback_data: active ? "model:noop" : `model:${index}` }];
+    })
+  };
 }
 
 function settingsKeyboard() {
@@ -1314,9 +1348,11 @@ async function command(chatId, userId, text, messageId, fromUser) {
       await sendRichBlocksMessage(chatId, statusBlocks(false), messageId);
       return true;
 
-    case "/models":
-      await sendRichBlocksMessage(chatId, modelsBlocks(), messageId);
+    case "/models": {
+      const canChange = !ADMIN_IDS.size || ADMIN_IDS.has(String(userId));
+      await sendRichBlocksMessage(chatId, modelsBlocks(canChange), messageId, canChange ? { reply_markup: modelsKeyboard() } : {});
       return true;
+    }
 
     default:
       return false;
@@ -1364,6 +1400,30 @@ async function handleCallbackQuery(callbackQuery) {
   if (data === "settings:export") {
     await answerCallbackQuery(callbackQuery.id, "Exporting your history…");
     await exportHistory(chatId, userId, messageId);
+    return;
+  }
+  if (data === "model:noop") {
+    await answerCallbackQuery(callbackQuery.id, "That's already the primary model.");
+    return;
+  }
+  if (data.startsWith("model:")) {
+    const canChange = !ADMIN_IDS.size || ADMIN_IDS.has(String(userId));
+    if (!canChange) {
+      await answerCallbackQuery(callbackQuery.id, "Only admins can change the primary model.", true);
+      return;
+    }
+    const index = Number(data.slice("model:".length));
+    const model = Number.isInteger(index) ? FREE_MODELS[index] : null;
+    if (!model) {
+      await answerCallbackQuery(callbackQuery.id, "Unknown model.", true);
+      return;
+    }
+    TEXT_MODEL = model.id;
+    console.log(`[models] primary model switched to ${sanitizeLog(model.id)} by user=${sanitizeLog(userId)}`);
+    await answerCallbackQuery(callbackQuery.id, `✅ Primary model set to ${model.label}`);
+    if (messageId) {
+      await tg("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: modelsKeyboard() }).catch(() => {});
+    }
     return;
   }
   await answerCallbackQuery(callbackQuery.id);
