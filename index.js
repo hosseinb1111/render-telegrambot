@@ -50,6 +50,15 @@ import express from "express";
 //     content field paired with tool_calls) — now use `content: ""` instead.
 // 11. Free model catalog (see FREE_MODELS below) has been refreshed to the
 //     currently available free OpenRouter models; the old list was removed.
+// 12. NEW — Two-deep free-model fallback chain: if the primary text model
+//     is unavailable/rate-limited/errors out, the bot now falls through to
+//     MiniMax M2.7 (free) and then, as a last resort, OpenRouter's built-in
+//     "openrouter/free" auto-router (which picks whatever free model is
+//     currently healthy on OpenRouter's end). This is aimed squarely at
+//     "don't hit the free-tier rate limit and just fail" — see
+//     chooseModelChain() and the retry loop in generate(). "openrouter/free"
+//     was also added to the FREE_MODELS catalog so it's selectable from
+//     /models, and /models itself now renders the whole fallback order.
 // ============================================================================
 
 const TG_API = "https://api.telegram.org",
@@ -94,7 +103,15 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "",
   // ---------------------------------------------------------------------
   SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "You are a helpful AI assistant. Answer accurately, clearly, naturally, and concisely.",
   PRIMARY_TEXT_MODEL = process.env.OPENROUTER_MODEL || "z-ai/glm-5.2:free",
-  FALLBACK_TEXT_MODEL = process.env.OPENROUTER_MODEL_FALLBACK || "nvidia/nemotron-3.5-lightning:free",
+  // ---------------------------------------------------------------------
+  // Fallback chain (in order): PRIMARY_TEXT_MODEL -> FALLBACK_TEXT_MODEL
+  // -> SECOND_FALLBACK_TEXT_MODEL. See chooseModelChain() below. This
+  // exists specifically so a rate-limited/unavailable free model doesn't
+  // just fail the request — the bot automatically retries with the next
+  // model in the chain (see the retry loop in generate()).
+  // ---------------------------------------------------------------------
+  FALLBACK_TEXT_MODEL = process.env.OPENROUTER_MODEL_FALLBACK || "minimax/minimax-m2.7:free",
+  SECOND_FALLBACK_TEXT_MODEL = process.env.OPENROUTER_MODEL_FALLBACK_2 || "openrouter/free",
   VISION_MODEL = process.env.OPENROUTER_VISION_MODEL || "openrouter/free",
   FILE_MODEL = process.env.OPENROUTER_FILE_MODEL || "openrouter/free",
   PORT = Number(process.env.PORT || 3000);
@@ -111,17 +128,25 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "",
 // chat/completions-capable models are listed here — reranking and
 // classifier-only models (e.g. embedding rerankers, content-safety
 // classifiers) are intentionally excluded because they can't serve as a
-// primary chat model.
+// primary chat model. "openrouter/free" is OpenRouter's own auto-router
+// across whatever free models are currently healthy — it's included here as
+// a selectable/visible option (and doubles as the last-resort fallback, see
+// SECOND_FALLBACK_TEXT_MODEL above).
 const FREE_MODELS = [
   { id: "z-ai/glm-5.2:free", label: "GLM 5.2" },
+  { id: "minimax/minimax-m2.7:free", label: "MiniMax M2.7" },
   { id: "cohere/north-mini-code:free", label: "North Mini Code" },
   { id: "nvidia/nemotron-3.5-lightning:free", label: "Nemotron 3.5 Lightning" },
   { id: "nvidia/nemotron-3-ultra-550b-a55b:free", label: "Nemotron 3 Ultra" },
   { id: "liquid/lfm-2.5-2.6b:free", label: "LFM2.5-2.6B" },
-  { id: "thinkingmachines/inkling-small:free", label: "Inkling Small" }
+  { id: "thinkingmachines/inkling-small:free", label: "Inkling Small" },
+  { id: "openrouter/free", label: "OpenRouter Free (auto-routed)" }
 ];
-// De-dupe in case PRIMARY_TEXT_MODEL/FALLBACK_TEXT_MODEL from env already match an entry above.
-if (!FREE_MODELS.some(m => m.id === PRIMARY_TEXT_MODEL)) FREE_MODELS.unshift({ id: PRIMARY_TEXT_MODEL, label: PRIMARY_TEXT_MODEL });
+// De-dupe in case PRIMARY_TEXT_MODEL / FALLBACK_TEXT_MODEL / SECOND_FALLBACK_TEXT_MODEL
+// from env already match an entry above, or were customized to something not in the list.
+for (const configuredModel of [PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, SECOND_FALLBACK_TEXT_MODEL]) {
+  if (!FREE_MODELS.some(m => m.id === configuredModel)) FREE_MODELS.unshift({ id: configuredModel, label: configuredModel });
+}
 
 let TEXT_MODEL = PRIMARY_TEXT_MODEL;
 
@@ -1022,11 +1047,23 @@ async function ensureImageModel(model) {
   return true;
 }
 
+// Builds the ordered list of text models to try for a request. Order is:
+// 1) TEXT_MODEL (the currently active primary — mutable via /models)
+// 2) FALLBACK_TEXT_MODEL (defaults to MiniMax M2.7, free)
+// 3) SECOND_FALLBACK_TEXT_MODEL (defaults to "openrouter/free", OpenRouter's
+//    own auto-router across whatever free models are healthy right now)
+// Duplicates are skipped (e.g. if an admin sets the primary model to the
+// same id as a configured fallback) so the same model is never retried
+// twice in a row. This whole chain exists so a single free model hitting
+// its rate limit doesn't fail the request outright — see the retry loop in
+// generate(), which advances to the next model in this chain on any error
+// that happens before the first token is streamed back.
 function chooseModelChain({ image, file }) {
   if (image) return [VISION_MODEL];
   if (file) return [FILE_MODEL];
   const chain = [TEXT_MODEL];
-  if (FALLBACK_TEXT_MODEL && FALLBACK_TEXT_MODEL !== TEXT_MODEL) chain.push(FALLBACK_TEXT_MODEL);
+  if (FALLBACK_TEXT_MODEL && !chain.includes(FALLBACK_TEXT_MODEL)) chain.push(FALLBACK_TEXT_MODEL);
+  if (SECOND_FALLBACK_TEXT_MODEL && !chain.includes(SECOND_FALLBACK_TEXT_MODEL)) chain.push(SECOND_FALLBACK_TEXT_MODEL);
   return chain;
 }
 
@@ -1697,16 +1734,32 @@ function statusBlocks(admin = false) {
   return blocks;
 }
 
+// Renders /models with the full live fallback order (so users can see
+// exactly what will be tried, in order, if a model is unavailable or
+// rate-limited), followed by the raw model IDs in inline code, and a
+// tappable list of every catalog entry to pick a new primary model from.
 function modelsBlocks(canChange) {
+  const chain = chooseModelChain({ image: false, file: false });
+  const labelFor = (id) => FREE_MODELS.find(m => m.id === id)?.label || id;
+
   return [
     rb.heading("🤖 Active models", 3),
+    rb.paragraph("Text requests are tried in this order. If a model is unavailable, rate-limited, or errors out, the bot automatically falls through to the next one — so a free-tier limit doesn't fail your request:"),
+    rb.numberedList(chain.map((id, i) => {
+      const roleLabel = i === 0 ? "primary" : `fallback ${i}`;
+      return [rt.bold(labelFor(id)), ` — ${roleLabel}`];
+    })),
+    rb.divider(),
+    rb.heading("Model IDs", 4),
     rb.bulletList([
-      `Primary: ${TEXT_MODEL}`,
-      `Fallback: ${FALLBACK_TEXT_MODEL}`,
-      `Vision: ${VISION_MODEL}`,
-      `Files: ${FILE_MODEL}`
+      [rt.bold("Primary: "), rt.code(TEXT_MODEL)],
+      [rt.bold("Fallback 1: "), rt.code(FALLBACK_TEXT_MODEL)],
+      [rt.bold("Fallback 2: "), rt.code(SECOND_FALLBACK_TEXT_MODEL)],
+      [rt.bold("Vision: "), rt.code(VISION_MODEL)],
+      [rt.bold("Files: "), rt.code(FILE_MODEL)]
     ]),
-    rb.paragraph(canChange ? "Tap a model below to make it the primary model." : "Only admins can change the primary model.")
+    rb.divider(),
+    rb.footer(canChange ? "Tap a model below to make it the new primary model." : "Only admins can change the primary model.")
   ];
 }
 
