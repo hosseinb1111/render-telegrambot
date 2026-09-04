@@ -803,7 +803,7 @@ async function performToolCalls(toolCalls, searchState) {
 }
 
 function escHtml(value) { return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-function thinkingHtml(stage = "Thinking") { return `<tg-thinking>${escHtml(stage)}</tg-thinking>`; }
+function thinkingHtml(stage = "Thinking...") { return `<tg-thinking>${escHtml(stage)}</tg-thinking>`; }
 function formatElapsed(seconds) {
   const total = Math.max(0, Math.floor(seconds)), m = Math.floor(total / 60), s = total % 60;
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
