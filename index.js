@@ -1,5 +1,5 @@
 import express from "express";
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import fs from "fs";
 import path from "path";
 
@@ -12,11 +12,13 @@ import path from "path";
 //     web", ...) now ALWAYS renders with exactly three trailing dots, on its
 //     own line, with the elapsed timer on the line below — see
 //     withEllipsis() / statusWithTimerHtml().
-//  B. SQLite persistence (better-sqlite3): conversation history, personas,
-//     reminders, known users, and per-user usage stats now survive restarts
-//     and redeploys instead of living only in a JS Map. Run
-//       npm install better-sqlite3
-//     and the DB file is created automatically (see DATA_DIR / DB_PATH).
+//  B. SQLite persistence (Node's built-in node:sqlite): conversation history,
+//     personas, reminders, known users, and per-user usage stats now survive
+//     restarts and redeploys instead of living only in a JS Map. No native
+//     module install is required — node:sqlite ships with Node.js 22+ and
+//     needs no compilation, so it works out of the box on any deploy
+//     platform (musl/Alpine included). The DB file is created automatically
+//     (see DATA_DIR / DB_PATH).
 //  C. /cancel — aborts your in-flight generation immediately.
 //  D. Graceful shutdown — SIGTERM/SIGINT stops accepting new webhook work,
 //     lets in-flight jobs finish (with a timeout), and closes the DB cleanly.
@@ -44,6 +46,11 @@ import path from "path";
 //
 // Nothing above changes existing behavior for search, generation, or
 // formatting beyond item A (which was a pure display bugfix).
+//
+// NOTE ON node:sqlite: this requires Node.js 22 or newer (it's still
+// experimental upstream but stable enough for this use case). If your
+// platform pins an older Node version, bump it in package.json's "engines"
+// field and in the platform's Node version setting.
 // ============================================================================
 
 const TG_API = "https://api.telegram.org",
@@ -193,13 +200,14 @@ function configWarnings() {
 configWarnings();
 
 // ---------------------------------------------------------------------------
-// Persistence (SQLite via better-sqlite3)
+// Persistence (SQLite via Node's built-in node:sqlite — no native module
+// install/compile step required, unlike better-sqlite3)
 //
 // Backs conversation history / personas (the "kv" table, mirroring the old
 // in-memory Map's key/value/expires shape), reminders, known users (for
 // /broadcast), and per-user usage stats. The in-memory Map is kept as a hot
 // cache — reads go through it — but every write is mirrored to disk so nothing
-// is lost across restarts/redeploys. Requires: npm install better-sqlite3
+// is lost across restarts/redeploys.
 // ---------------------------------------------------------------------------
 
 const DATA_DIR = process.env.DATA_DIR || "./data";
@@ -208,8 +216,8 @@ const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, "bot.db");
 
 let db;
 try {
-  db = new Database(DB_PATH);
-  db.pragma("journal_mode = WAL");
+  db = new DatabaseSync(DB_PATH);
+  db.exec("PRAGMA journal_mode = WAL;");
   db.exec(`
     CREATE TABLE IF NOT EXISTS kv (
       key TEXT PRIMARY KEY,
@@ -263,6 +271,10 @@ const usersCountStmt = db.prepare(`SELECT COUNT(*) AS c FROM users`);
 const usageSelectStmt = db.prepare(`SELECT * FROM usage WHERE user_id = ?`);
 const usageUpsertStmt = db.prepare(`INSERT INTO usage (user_id, requests, searches, models_json, last_active) VALUES (?, 1, ?, ?, ?)
   ON CONFLICT(user_id) DO UPDATE SET requests = requests + 1, searches = searches + excluded.searches, models_json = excluded.models_json, last_active = excluded.last_active`);
+
+// node:sqlite's StatementSync.run() requires plain bind params (no
+// `undefined`) the same way better-sqlite3 does, and .get()/.all() return
+// plain objects — so the rest of this file's DB call sites work unchanged.
 
 function trackUser(userId, chatId, username) {
   try { userUpsertStmt.run(String(userId), String(chatId), username || null, Date.now(), Date.now()); }
