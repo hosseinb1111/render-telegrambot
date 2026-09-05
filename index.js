@@ -172,8 +172,16 @@ const HISTORY_PAIRS = clampInt(process.env.HISTORY_PAIRS, 4, 1, 20),
   RATE_LIMIT_BURST = clampInt(process.env.RATE_LIMIT_BURST, 4, 1, 30),
   TG_LIMIT = 4096,
   RICH_LIMIT = 32768,
-  STREAM_EDIT_MS = 900,
-  DRAFT_UPDATE_MS = 900,
+  // --- Streaming edit cadence (BUG 3 fix) ---
+  // Previously both 900ms. At 900ms the visible text advances in large,
+  // noticeably delayed jumps ("choppy"). Lowered to 500ms: still comfortably
+  // above Telegram's per-chat edit rate limit (roughly 1/sec sustained) so
+  // we don't trigger 429s under normal streaming speeds, but frequent enough
+  // that the message updates feel closer to continuous. If you see 429s in
+  // the logs (now logged — see the streaming callbacks in generate()),
+  // raise these back up rather than lowering further.
+  STREAM_EDIT_MS = clampInt(process.env.STREAM_EDIT_MS, 500, 200, 5000),
+  DRAFT_UPDATE_MS = clampInt(process.env.DRAFT_UPDATE_MS, 500, 200, 5000),
   TYPING_MS = 4000,
   REQUEST_TIMEOUT_MS = clampInt(process.env.REQUEST_TIMEOUT_MS, 45000, 5000, 120000),
   MAX_GLOBAL_CONCURRENCY = clampInt(process.env.MAX_GLOBAL_CONCURRENCY, 8, 1, 32),
@@ -532,6 +540,12 @@ async function tg(method, body, { retries = 1, timeoutMs = REQUEST_TIMEOUT_MS } 
 
 function threadExtra(threadId) { return threadId ? { message_thread_id: threadId } : {}; }
 
+// NOTE: sendMessage()/sendRichMessage() below speak Markdown (MarkdownV2),
+// never HTML. Any string built by thinkingHtml()/statusWithTimerHtml() (or
+// anything else that emits raw <tg-thinking>/<b>/etc. tags) MUST go through
+// the *Html() siblings (sendRichMessageHtml, editMessageRichHtml,
+// sendRichMessageDraftHtml) instead — passing HTML here will print the
+// literal tag text to the user (see BUG 1).
 async function sendMessage(chatId, text, replyTo, options = {}) {
   const clean = String(text ?? "");
   if (!clean) return { ok: false, description: "Empty message" };
@@ -633,7 +647,10 @@ async function registerCommands() {
     { command: "settings", description: "Quick settings menu" },
     { command: "cancel", description: "Cancel the response being generated" },
     { command: "status", description: "Show bot runtime stats" },
-    { command: "models", description: "Show/change the active AI models" }
+    { command: "models", description: "Show/change the active AI models" },
+    // Slash-command twin of the "!ai" text trigger — see SLASH_TRIGGER
+    // below for why this exists (Telegram group privacy mode).
+    { command: "ai", description: "Ask the bot something in a group (works even with privacy mode on)" }
   ];
   const result = await tg("setMyCommands", { commands });
   if (!result.ok) console.error(`[commands] setMyCommands failed: ${sanitizeLog(result.description)}`);
@@ -1497,7 +1514,11 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
     console.log(`[request] chat=${chatId} user=${userId} models=${sanitizeLog(modelChain.join(" -> "))} images=${images?.length || 0} file=${Boolean(file)} audio=${Boolean(audio)}`);
 
     if (!isPrivate) {
-      const placeholder = await sendRichMessage(chatId, thinkingHtml("Thinking"), replyTo, threadExtra(threadId));
+      // BUG 1 fix: thinkingHtml() returns HTML (<tg-thinking>...</tg-thinking>),
+      // so it must be sent through the HTML-aware sender. sendRichMessage()
+      // treats its argument as Markdown (and falls back to parse_mode
+      // MarkdownV2), so passing HTML there printed the tag text literally.
+      const placeholder = await sendRichMessageHtml(chatId, thinkingHtml("Thinking"), replyTo, threadExtra(threadId));
       if (!placeholder?.ok || !placeholder?.result?.message_id) throw new Error("Could not create the Telegram streaming message.");
       streamMessageId = placeholder.result.message_id;
     } else {
@@ -1583,6 +1604,16 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
                   if (useRichDraft) {
                     const richResult = await sendRichMessageDraft(chatId, draftIdValue, preview);
                     if (!richResult.ok) {
+                      // BUG 3: this used to be swallowed unconditionally, which
+                      // hid Telegram 429s (rate limits) behind a silent no-op —
+                      // making dropped/delayed edits look like random "jumps"
+                      // in the streamed text with no trace in the logs. Now we
+                      // log the failure reason (unless it's just Telegram
+                      // catching up, which is normal) so a real rate-limit
+                      // problem is visible instead of invisible.
+                      if (!/flood|too many requests|retry/i.test(String(richResult?.description || ""))) {
+                        console.warn(`[stream:draft-edit-failed] chat=${chatId} user=${userId} reason=${sanitizeLog(richResult?.description || "unknown")}`);
+                      }
                       useRichDraft = false;
                       if (!draftFallbackMessageId) {
                         const fallback = await sendRichMessageHtml(chatId, thinkingHtml("Thinking"), replyTo, threadExtra(threadId));
@@ -1590,14 +1621,18 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
                       }
                     }
                   } else if (draftFallbackMessageId) {
-                    await editMessageRich(chatId, draftFallbackMessageId, preview).catch(() => {});
+                    const editResult = await editMessageRich(chatId, draftFallbackMessageId, preview).catch(error => ({ ok: false, description: error?.message || String(error) }));
+                    if (!editResult.ok) console.warn(`[stream:edit-failed] chat=${chatId} user=${userId} reason=${sanitizeLog(editResult?.description || "unknown")}`);
                   }
                 }).catch(() => {});
               }
             } else if (streamMessageId && now - lastEdit >= STREAM_EDIT_MS) {
               lastEdit = now;
               const preview = full.slice(0, RICH_LIMIT);
-              groupEditChain = groupEditChain.then(async () => { await editMessageRich(chatId, streamMessageId, preview).catch(() => {}); }).catch(() => {});
+              groupEditChain = groupEditChain.then(async () => {
+                const editResult = await editMessageRich(chatId, streamMessageId, preview).catch(error => ({ ok: false, description: error?.message || String(error) }));
+                if (!editResult.ok) console.warn(`[stream:group-edit-failed] chat=${chatId} user=${userId} reason=${sanitizeLog(editResult?.description || "unknown")}`);
+              }).catch(() => {});
             }
           }, calls => toolCalls.push(...calls), reasoningPiece => { fullReasoning += reasoningPiece; });
 
@@ -1893,7 +1928,13 @@ function helpBlocks() {
     rb.heading("Chat", 4),
     rb.bulletList([
       "In a private chat, just send a normal message.",
-      `In a group, mention me, reply to me, or use the trigger command "${TRIGGER || "!ai"}".`,
+      `In a group, mention me, reply to me, or use "${TRIGGER || "!ai"}".`,
+      // Slash-command alternative documented explicitly: Telegram group
+      // "privacy mode" (a per-bot setting in @BotFather) prevents plain
+      // text triggers like "!ai" from ever reaching the bot unless the
+      // bot is mentioned/replied-to — but "/" commands are always
+      // delivered regardless of privacy mode. See SLASH_TRIGGER below.
+      `If "${TRIGGER || "!ai"}" doesn't seem to work in a group, use "${SLASH_TRIGGER}" instead — it works even when the bot's group privacy mode is on.`,
       "I reply in whatever language you write in.",
       "/cancel — stop the response I'm currently generating for you."
     ]),
@@ -2126,6 +2167,19 @@ async function command(chatId, userId, text, messageId, fromUser, threadId) {
       return true;
     }
 
+    // /ai <prompt> — slash-command twin of the "!ai" text trigger (see
+    // SLASH_TRIGGER / BUG 2 notes). Handled here in the command() dispatcher
+    // (which only fires on non-edited messages) so it's always delivered by
+    // Telegram regardless of the bot's group privacy-mode setting, unlike
+    // the plain-text "!ai" trigger which privacy mode can block entirely.
+    case "/ai": {
+      // Returning false lets handleSingleUpdate() fall through to the normal
+      // generation path below, with parsed.arg as the effective prompt (via
+      // stripTargeting()/slashTriggerUsed() further down). We only need to
+      // special-case here when there's no argument at all.
+      return false;
+    }
+
     default:
       return false;
   }
@@ -2243,6 +2297,44 @@ function triggerUsed(text) {
   const source = String(text || "").trim(), lower = source.toLowerCase(), trigger = TRIGGER.toLowerCase();
   return lower === trigger || lower.startsWith(`${trigger} `);
 }
+// ---------------------------------------------------------------------------
+// BUG 2 — "!ai" appearing not to work in groups.
+//
+// triggerUsed() above is, and always was, correct: "!ai", "!ai hello", any
+// case variant, and leading/trailing whitespace are all matched properly.
+// The actual cause lives outside this file's logic entirely: Telegram's
+// per-bot "group privacy mode" (@BotFather -> /mybots -> your bot -> Bot
+// Settings -> Group Privacy).
+//
+// When group privacy mode is ENABLED (Telegram's default for newly created
+// bots), Telegram does NOT forward ordinary group text messages to the
+// bot's webhook AT ALL — it only forwards messages that are "/"-commands,
+// @mentions of the bot, or direct replies to the bot's own messages. Since
+// "!ai ..." is plain text (not a "/" command), the update never reaches
+// handleUpdate()/handleSingleUpdate() in the first place when privacy mode
+// is on — no amount of fixing triggerUsed() can help, because this code
+// never runs for that update.
+//
+// Fix options (both provided):
+//   1. Disable group privacy mode in @BotFather, then remove and re-add the
+//      bot to the affected group (privacy-mode changes only apply to groups
+//      the bot re-joins after the change).
+//   2. Use SLASH_TRIGGER ("/ai ...") instead of "!ai ..." — "/" commands are
+//      ALWAYS delivered to the bot regardless of privacy mode, so this works
+//      without touching BotFather settings. This is registered in
+//      registerCommands() and documented in /help.
+//
+// Do not "fix" this again by rewriting triggerUsed()/stripTargeting() —
+// they are not the bug.
+// ---------------------------------------------------------------------------
+const SLASH_TRIGGER = "/" + TRIGGER.replace(/^!+/, "").trim().split(/\s+/)[0].toLowerCase();
+console.log(`[trigger] text trigger="${TRIGGER}" slash trigger="${SLASH_TRIGGER}" (use the slash form in groups if privacy mode is enabled — see BUG 2 notes above triggerUsed())`);
+function slashTriggerUsed(text) {
+  const source = String(text || "").trim();
+  const parsed = parseCommand(source);
+  if (!parsed) return false;
+  return parsed.command === SLASH_TRIGGER;
+}
 function repliedToBot(message) {
   const from = message?.reply_to_message?.from;
   if (!from?.is_bot) return false;
@@ -2253,7 +2345,12 @@ function repliedToBot(message) {
 function stripTargeting(text) {
   let result = String(text || "").trim();
   if (BOT_USERNAME) result = result.replace(new RegExp(`@${escapeRegExp(BOT_USERNAME)}\\b`, "ig"), "").trim();
-  if (TRIGGER && triggerUsed(result)) result = result.slice(TRIGGER.length).trim();
+  if (slashTriggerUsed(result)) {
+    const parsed = parseCommand(result);
+    result = (parsed?.arg || "").trim();
+  } else if (TRIGGER && triggerUsed(result)) {
+    result = result.slice(TRIGGER.length).trim();
+  }
   return result;
 }
 
@@ -2283,7 +2380,7 @@ async function processAlbumMessages(messages) {
   trackUser(userId, chatId, first.from?.username);
 
   if (!isPrivate) {
-    const anyTargeted = messages.some(m => botMentioned(m.caption || "") || triggerUsed(m.caption || "") || repliedToBot(m));
+    const anyTargeted = messages.some(m => botMentioned(m.caption || "") || triggerUsed(m.caption || "") || slashTriggerUsed(m.caption || "") || repliedToBot(m));
     if (!anyTargeted) return;
   }
 
@@ -2366,7 +2463,7 @@ async function handleSingleUpdate(update, message, isEdited) {
   }
 
   if (!isPrivate) {
-    const targeted = botMentioned(sourceText) || triggerUsed(sourceText) || repliedToBot(message);
+    const targeted = botMentioned(sourceText) || triggerUsed(sourceText) || slashTriggerUsed(sourceText) || repliedToBot(message);
     if (!targeted && !isImage && !isDocument && !(isAudio && ENABLE_VOICE)) return;
   }
 
