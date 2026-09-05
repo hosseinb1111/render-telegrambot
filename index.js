@@ -5,52 +5,6 @@ import path from "path";
 
 // ============================================================================
 // Telegram AI Bot — persistence & reliability edition
-//
-// Everything from the previous version is kept as-is. This revision adds:
-//
-//  A. Thinking-dots fix: the status stage label ("Thinking", "Searching the
-//     web", ...) now ALWAYS renders with exactly three trailing dots, on its
-//     own line, with the elapsed timer on the line below — see
-//     withEllipsis() / statusWithTimerHtml().
-//  B. SQLite persistence (Node's built-in node:sqlite): conversation history,
-//     personas, reminders, known users, and per-user usage stats now survive
-//     restarts and redeploys instead of living only in a JS Map. No native
-//     module install is required — node:sqlite ships with Node.js 22+ and
-//     needs no compilation, so it works out of the box on any deploy
-//     platform (musl/Alpine included). The DB file is created automatically
-//     (see DATA_DIR / DB_PATH).
-//  C. /cancel — aborts your in-flight generation immediately.
-//  D. Graceful shutdown — SIGTERM/SIGINT stops accepting new webhook work,
-//     lets in-flight jobs finish (with a timeout), and closes the DB cleanly.
-//  E. Per-user rate limiting (token bucket) — protects your OpenRouter /
-//     LangSearch quota from a single user hammering the bot. Configurable
-//     via RATE_LIMIT_PER_MIN / RATE_LIMIT_BURST.
-//  F. Per-user usage logging (requests, searches, model mix) in SQLite,
-//     visible in /admin.
-//  G. Photo album (media group) support — send multiple photos at once and
-//     they're batched into a single request instead of handled one by one.
-//  H. Voice/audio transcription — OFF by default (set
-//     ENABLE_VOICE_TRANSCRIPTION=true to turn it on) so it never silently
-//     starts consuming quota. When enabled, it reuses the same OpenRouter
-//     chat-completions path with an audio-capable model.
-//  I. Forum topic (message_thread_id) support — replies land back in the
-//     same topic instead of the group's general thread.
-//  J. setMyCommands on startup — the Telegram "/" menu now lists real
-//     commands with descriptions.
-//  K. Admin alerting — if a request fails through the *entire* model
-//     fallback chain, admins get a throttled DM about it.
-//  L. /broadcast <message> — admin-only, messages every known chat.
-//  M. /models now has a "🔄 Refresh catalog" button (admin-only) to force a
-//     fresh pull of OpenRouter's model list without waiting for the 10-minute
-//     cache to expire.
-//
-// Nothing above changes existing behavior for search, generation, or
-// formatting beyond item A (which was a pure display bugfix).
-//
-// NOTE ON node:sqlite: this requires Node.js 22 or newer (it's still
-// experimental upstream but stable enough for this use case). If your
-// platform pins an older Node version, bump it in package.json's "engines"
-// field and in the platform's Node version setting.
 // ============================================================================
 
 const TG_API = "https://api.telegram.org",
@@ -67,67 +21,16 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "",
   LANGSEARCH_KEY = process.env.LANGSEARCH_API_KEY || "",
   BOT_USERNAME = String(process.env.BOT_USERNAME || "").replace(/^@/, ""),
   TRIGGER = String(process.env.TRIGGER_COMMAND || "!ai").trim(),
-  // ---------------------------------------------------------------------
-  // SYSTEM_PROMPT — this IS the "custom default role" env var.
-  // Set it in your hosting platform's environment variables (Render,
-  // Railway, Docker, .env file, etc.) to change the bot's base persona
-  // for every user, e.g.:
-  //
-  //   SYSTEM_PROMPT="You are a senior, meticulous research and coding
-  //   assistant. Prioritize accuracy over speed: verify claims, state
-  //   uncertainty explicitly instead of guessing, show your reasoning
-  //   for non-trivial answers, and give complete, well-structured,
-  //   directly usable answers (working code, concrete steps, exact
-  //   numbers) rather than vague overviews. Ask a clarifying question
-  //   only when the request is genuinely ambiguous; otherwise make the
-  //   most reasonable assumption, state it briefly, and proceed."
-  //
-  // This is separate from /persona, which lets an individual user layer
-  // extra instructions on top of this base prompt (see cleanSystem()).
-  //
-  // NOTE ON RELIABILITY: this prompt is always attached as the first
-  // message of every request (see buildMessages()). It is ALSO echoed,
-  // in condensed form, as a second "reminder" system message placed
-  // right before the user's turn on every request (see
-  // reinforcementMessage()). This "sandwich" placement is what keeps
-  // small/free models from drifting away from the persona over a long
-  // conversation.
-  // ---------------------------------------------------------------------
   SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "You are a helpful AI assistant. Answer accurately, clearly, naturally, and concisely.",
   PRIMARY_TEXT_MODEL = process.env.OPENROUTER_MODEL || "z-ai/glm-5.2:free",
-  // ---------------------------------------------------------------------
-  // Fallback chain (in order): PRIMARY_TEXT_MODEL -> FALLBACK_TEXT_MODEL
-  // -> SECOND_FALLBACK_TEXT_MODEL. See chooseModelChain() below. This
-  // exists specifically so a rate-limited/unavailable free model doesn't
-  // just fail the request — the bot automatically retries with the next
-  // model in the chain (see the retry loop in generate()).
-  // ---------------------------------------------------------------------
   FALLBACK_TEXT_MODEL = process.env.OPENROUTER_MODEL_FALLBACK || "minimax/minimax-m2.7:free",
   SECOND_FALLBACK_TEXT_MODEL = process.env.OPENROUTER_MODEL_FALLBACK_2 || "openrouter/free",
   VISION_MODEL = process.env.OPENROUTER_VISION_MODEL || "openrouter/free",
   FILE_MODEL = process.env.OPENROUTER_FILE_MODEL || "openrouter/free",
-  // Audio is a separate, opt-in model slot — see ENABLE_VOICE below. It
-  // defaults to the auto-router too, but it is never used unless voice
-  // transcription is explicitly turned on.
   AUDIO_MODEL = process.env.OPENROUTER_AUDIO_MODEL || "openrouter/free",
+  PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, ""),
   PORT = Number(process.env.PORT || 3000);
 
-// ---------------------------------------------------------------------------
-// Free-model catalog + the currently active main (primary) model.
-// TEXT_MODEL is intentionally mutable — /models lets an admin switch the bot's
-// main text model at runtime without a redeploy. It resets to PRIMARY_TEXT_MODEL
-// on restart since it's kept in memory only, matching the rest of this file's
-// "in-memory, best-effort" state (reminders, per-user history, etc. are now
-// persisted to SQLite — see the persistence section below — but the *active*
-// primary model choice is intentionally still a runtime-only setting).
-//
-// This list was refreshed to the currently available free OpenRouter models.
-// Only general-purpose chat/completions-capable models are listed here —
-// reranking and classifier-only models are intentionally excluded because
-// they can't serve as a primary chat model. "openrouter/free" is
-// OpenRouter's own auto-router across whatever free models are currently
-// healthy — it's included here as a selectable/visible option (and doubles
-// as the last-resort fallback, see SECOND_FALLBACK_TEXT_MODEL above).
 const FREE_MODELS = [
   { id: "z-ai/glm-5.2:free", label: "GLM 5.2" },
   { id: "minimax/minimax-m2.7:free", label: "MiniMax M2.7" },
@@ -138,13 +41,18 @@ const FREE_MODELS = [
   { id: "thinkingmachines/inkling-small:free", label: "Inkling Small" },
   { id: "openrouter/free", label: "OpenRouter Free (auto-routed)" }
 ];
-// De-dupe in case PRIMARY_TEXT_MODEL / FALLBACK_TEXT_MODEL / SECOND_FALLBACK_TEXT_MODEL
-// from env already match an entry above, or were customized to something not in the list.
 for (const configuredModel of [PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, SECOND_FALLBACK_TEXT_MODEL]) {
   if (!FREE_MODELS.some(m => m.id === configuredModel)) FREE_MODELS.unshift({ id: configuredModel, label: configuredModel });
 }
 
 let TEXT_MODEL = PRIMARY_TEXT_MODEL;
+
+// ---------------------------------------------------------------------------
+// NEW: Admins are declared up-front (moved above alertAdmins/usage of it)
+// so we no longer need the TDZ placeholder-guard hack.
+// ---------------------------------------------------------------------------
+const ADMIN_IDS = new Set(String(process.env.ADMIN_IDS || "").split(",").map(v => v.trim()).filter(Boolean));
+function isAdminId(userId) { return ADMIN_IDS.has(String(userId)); }
 
 function clampInt(value, fallback, min, max) {
   const n = Number(value);
@@ -163,23 +71,13 @@ const HISTORY_PAIRS = clampInt(process.env.HISTORY_PAIRS, 4, 1, 20),
   MAX_OR_FILE_BYTES = clampInt(process.env.MAX_OPENROUTER_FILE_BYTES, 12 * 1024 * 1024, 1024, 20 * 1024 * 1024),
   MAX_PERSONA_CHARS = clampInt(process.env.MAX_PERSONA_CHARS, 600, 0, 2000),
   MAX_ALBUM_IMAGES = clampInt(process.env.MAX_ALBUM_IMAGES, 6, 1, 10),
-  // --- Direct URL Opening feature settings ---
   PAGE_TEXT_LIMIT = clampInt(process.env.PAGE_TEXT_LIMIT, 6000, 500, 20000),
   URL_FETCH_TIMEOUT_MS = clampInt(process.env.URL_FETCH_TIMEOUT_MS, 15000, 3000, 60000),
   MAX_URL_DOWNLOAD_BYTES = clampInt(process.env.MAX_URL_DOWNLOAD_BYTES, 3 * 1024 * 1024, 100 * 1024, 20 * 1024 * 1024),
-  // --- Rate limiting (token bucket per user) ---
   RATE_LIMIT_PER_MIN = clampInt(process.env.RATE_LIMIT_PER_MIN, 12, 1, 120),
   RATE_LIMIT_BURST = clampInt(process.env.RATE_LIMIT_BURST, 4, 1, 30),
   TG_LIMIT = 4096,
   RICH_LIMIT = 32768,
-  // --- Streaming edit cadence (BUG 3 fix) ---
-  // Previously both 900ms. At 900ms the visible text advances in large,
-  // noticeably delayed jumps ("choppy"). Lowered to 500ms: still comfortably
-  // above Telegram's per-chat edit rate limit (roughly 1/sec sustained) so
-  // we don't trigger 429s under normal streaming speeds, but frequent enough
-  // that the message updates feel closer to continuous. If you see 429s in
-  // the logs (now logged — see the streaming callbacks in generate()),
-  // raise these back up rather than lowering further.
   STREAM_EDIT_MS = clampInt(process.env.STREAM_EDIT_MS, 500, 200, 5000),
   DRAFT_UPDATE_MS = clampInt(process.env.DRAFT_UPDATE_MS, 500, 200, 5000),
   TYPING_MS = 4000,
@@ -195,10 +93,6 @@ const HISTORY_PAIRS = clampInt(process.env.HISTORY_PAIRS, 4, 1, 20),
   ENABLE_VOICE = String(process.env.ENABLE_VOICE_TRANSCRIPTION || "false").toLowerCase() === "true",
   WEBHOOK_PATH = WEBHOOK_PATH_TOKEN ? `/webhook/${WEBHOOK_PATH_TOKEN}` : "/webhook/UNCONFIGURED";
 
-// Runtime-toggleable mirror of ENABLE_VOICE (see admin panel: "Voice" button).
-// ENABLE_VOICE above stays as the env-derived startup default; voiceEnabled is
-// what the rest of the code actually checks, so an admin can flip it live
-// without a redeploy, same spirit as TEXT_MODEL.
 let voiceEnabled = ENABLE_VOICE;
 
 let botId = null, modelCatalog = null, modelCatalogLoadedAt = 0, modelCatalogAttemptedAt = 0, botInfo = null;
@@ -214,14 +108,7 @@ function configWarnings() {
 configWarnings();
 
 // ---------------------------------------------------------------------------
-// Persistence (SQLite via Node's built-in node:sqlite — no native module
-// install/compile step required, unlike better-sqlite3)
-//
-// Backs conversation history / personas (the "kv" table, mirroring the old
-// in-memory Map's key/value/expires shape), reminders, known users (for
-// /broadcast), and per-user usage stats. The in-memory Map is kept as a hot
-// cache — reads go through it — but every write is mirrored to disk so nothing
-// is lost across restarts/redeploys.
+// Persistence (SQLite)
 // ---------------------------------------------------------------------------
 
 const DATA_DIR = process.env.DATA_DIR || "./data";
@@ -287,10 +174,6 @@ const usageSelectStmt = db.prepare(`SELECT * FROM usage WHERE user_id = ?`);
 const usageUpsertStmt = db.prepare(`INSERT INTO usage (user_id, requests, searches, models_json, last_active) VALUES (?, 1, ?, ?, ?)
   ON CONFLICT(user_id) DO UPDATE SET requests = requests + 1, searches = searches + excluded.searches, models_json = excluded.models_json, last_active = excluded.last_active`);
 
-// node:sqlite's StatementSync.run() requires plain bind params (no
-// `undefined`) the same way better-sqlite3 does, and .get()/.all() return
-// plain objects — so the rest of this file's DB call sites work unchanged.
-
 function trackUser(userId, chatId, username) {
   try { userUpsertStmt.run(String(userId), String(chatId), username || null, Date.now(), Date.now()); }
   catch (error) { console.error(`[db:trackUser:error] ${sanitizeLog(error?.message || error)}`); }
@@ -305,14 +188,18 @@ function recordUsage(userId, model, searchCount) {
   } catch (error) { console.error(`[db:recordUsage:error] ${sanitizeLog(error?.message || error)}`); }
 }
 
+function getUsage(userId) {
+  try { return usageSelectStmt.get(String(userId)) || null; } catch { return null; }
+}
+
 // ---------------------------------------------------------------------------
-// In-memory state (hot cache; kv/history/persona are also mirrored to SQLite)
+// In-memory state
 // ---------------------------------------------------------------------------
 
 const memory = new Map, recentReactions = new Map, inFlightQueues = new Map, seenUpdates = new Map, reminders = [];
-const activeGenerations = new Map; // userId -> { controller, chatId, cancelled }
-const rateBuckets = new Map; // userId -> { tokens, updatedAt }
-const mediaGroups = new Map; // media_group_id -> { messages: [], timer }
+const activeGenerations = new Map;
+const rateBuckets = new Map;
+const mediaGroups = new Map;
 
 function loadMemoryFromDb() {
   const now = Date.now();
@@ -371,6 +258,8 @@ memoryCleanupTimer.unref?.();
 
 function historyKey(userId) { return `history:${String(userId)}`; }
 function personaKey(userId) { return `persona:${String(userId)}`; }
+// NEW: per-chat model override key
+function chatModelKey(chatId) { return `chatmodel:${String(chatId)}`; }
 
 function getHistory(userId) {
   const raw = memGet(historyKey(userId));
@@ -437,6 +326,41 @@ function setPersona(userId, text) {
 }
 
 // ---------------------------------------------------------------------------
+// NEW: Persona presets — canned personas selectable via inline buttons
+// (/persona list). Free text via /persona <text> still works as before and
+// always overrides a preset.
+// ---------------------------------------------------------------------------
+const PERSONA_PRESETS = [
+  { id: "default", label: "🤖 Default", text: "" },
+  { id: "concise", label: "✂️ Concise", text: "Be extremely concise. Prefer short sentences and bullet points. Never pad answers with filler or restate the question." },
+  { id: "teacher", label: "🎓 Patient Teacher", text: "Explain things step by step like a patient teacher. Use simple language, small examples, and check understanding by summarizing key points at the end." },
+  { id: "coder", label: "👨‍💻 Senior Engineer", text: "Act as a senior software engineer. Prioritize correctness and give complete, directly runnable code with brief explanations. Call out edge cases and trade-offs." },
+  { id: "friendly", label: "😊 Friendly & Casual", text: "Be warm, casual, and encouraging, like a helpful friend. Use simple everyday language and a bit of light humor where appropriate." },
+  { id: "formal", label: "🎩 Formal & Professional", text: "Respond in a formal, professional register suitable for business communication. Avoid slang, emojis, and casual phrasing." }
+];
+function findPersonaPreset(id) { return PERSONA_PRESETS.find(p => p.id === id) || null; }
+function personaPresetsKeyboard() {
+  const rows = PERSONA_PRESETS.map(p => [{ text: p.label, callback_data: `persona:${p.id}` }]);
+  return { inline_keyboard: rows };
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Per-chat model override. TEXT_MODEL remains the global default;
+// a chat can override it independently (e.g. a group wants a bigger model
+// while DMs stay on the fast default). Falls back to the global TEXT_MODEL
+// when no override is set for that chat.
+// ---------------------------------------------------------------------------
+function getChatModelOverride(chatId) { return memGet(chatModelKey(chatId)) || ""; }
+function setChatModelOverride(chatId, modelId) {
+  if (!modelId) { memDelete(chatModelKey(chatId)); return; }
+  memSet(chatModelKey(chatId), modelId);
+}
+function effectivePrimaryModel(chatId) {
+  const override = chatId != null ? getChatModelOverride(chatId) : "";
+  return override || TEXT_MODEL;
+}
+
+// ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
@@ -450,10 +374,6 @@ function formatUptime(seconds) {
 
 // ---------------------------------------------------------------------------
 // Rate limiting (per-user token bucket)
-//
-// Protects OpenRouter/LangSearch quota from a single user hammering the bot.
-// Purely in-memory/ephemeral (a reset on restart is harmless — worst case a
-// user gets a few extra requests right after a redeploy).
 // ---------------------------------------------------------------------------
 
 function checkRateLimit(userId) {
@@ -547,12 +467,6 @@ async function tg(method, body, { retries = 1, timeoutMs = REQUEST_TIMEOUT_MS } 
 
 function threadExtra(threadId) { return threadId ? { message_thread_id: threadId } : {}; }
 
-// NOTE: sendMessage()/sendRichMessage() below speak Markdown (MarkdownV2),
-// never HTML. Any string built by thinkingHtml()/statusWithTimerHtml() (or
-// anything else that emits raw <tg-thinking>/<b>/etc. tags) MUST go through
-// the *Html() siblings (sendRichMessageHtml, editMessageRichHtml,
-// sendRichMessageDraftHtml) instead — passing HTML here will print the
-// literal tag text to the user (see BUG 1).
 async function sendMessage(chatId, text, replyTo, options = {}) {
   const clean = String(text ?? "");
   if (!clean) return { ok: false, description: "Empty message" };
@@ -563,8 +477,6 @@ async function sendMessage(chatId, text, replyTo, options = {}) {
   }
   return tg("sendMessage", base);
 }
-
-// --- Rich Messages (Bot API 10.1) ---
 
 async function sendRichMessage(chatId, markdown, replyTo, extra = {}) {
   const clean = String(markdown ?? "");
@@ -582,10 +494,6 @@ async function sendRichMessageHtml(chatId, html, replyTo, extra = {}) {
   return result?.ok ? result : { ok: false, description: result?.description || "Rich HTML message failed" };
 }
 
-// Sends a message built from native InputRichBlock objects (headings, lists,
-// dividers, blockquotes, tables, ...) rather than markdown/html strings.
-// Falls back to a flattened Markdown rendering if the Rich Blocks API call
-// is rejected by the server (e.g. running against an older Bot API version).
 async function sendRichBlocksMessage(chatId, blocks, replyTo, extra = {}) {
   const result = await tg("sendRichMessage", { chat_id: chatId, rich_message: { blocks }, ...(replyTo ? { reply_parameters: { message_id: replyTo } } : {}), ...extra });
   if (result?.ok) return result;
@@ -641,8 +549,28 @@ async function getMe() {
   return result;
 }
 
-// Registers the bot's "/" command menu in Telegram clients. Safe to call on
-// every startup — it's idempotent.
+// ---------------------------------------------------------------------------
+// NEW: setWebhook on startup. Registers PUBLIC_URL + WEBHOOK_PATH with
+// Telegram automatically so a redeploy that rotates WEBHOOK_PATH_TOKEN
+// doesn't silently go dark until someone remembers to call setWebhook by
+// hand. Set PUBLIC_URL to your deployed base URL (e.g.
+// https://my-bot.onrender.com). If PUBLIC_URL is not set, this is skipped
+// and you're expected to manage the webhook manually, same as before.
+// ---------------------------------------------------------------------------
+async function registerWebhook() {
+  if (!PUBLIC_URL) { console.log("[webhook] PUBLIC_URL not set — skipping automatic setWebhook (manage it manually)."); return; }
+  if (!WEBHOOK_PATH_TOKEN) { console.error("[webhook] WEBHOOK_PATH_TOKEN invalid/missing — cannot register webhook."); return; }
+  const url = `${PUBLIC_URL}${WEBHOOK_PATH}`;
+  const result = await tg("setWebhook", {
+    url,
+    secret_token: WEBHOOK_SECRET || undefined,
+    allowed_updates: ["message", "edited_message", "callback_query"],
+    drop_pending_updates: false
+  });
+  if (result.ok) console.log(`[webhook] registered at ${url}`);
+  else console.error(`[webhook] setWebhook failed: ${sanitizeLog(result.description)}`);
+}
+
 async function registerCommands() {
   const commands = [
     { command: "start", description: "Show the welcome message" },
@@ -655,8 +583,7 @@ async function registerCommands() {
     { command: "cancel", description: "Cancel the response being generated" },
     { command: "status", description: "Show bot runtime stats" },
     { command: "models", description: "Show/change the active AI models" },
-    // Slash-command twin of the "!ai" text trigger — see SLASH_TRIGGER
-    // below for why this exists (Telegram group privacy mode).
+    { command: "usage", description: "Show your personal usage stats" },
     { command: "ai", description: "Ask the bot something in a group (works even with privacy mode on)" }
   ];
   const result = await tg("setMyCommands", { commands });
@@ -664,13 +591,13 @@ async function registerCommands() {
   else console.log("[commands] command menu registered");
 }
 
-async function sendDocumentBuffer(chatId, buffer, filename, caption, replyTo, threadId) {
+async function sendDocumentBuffer(chatId, buffer, filename, caption, replyTo, threadId, mimeType) {
   const form = new FormData();
   form.append("chat_id", String(chatId));
   if (caption) form.append("caption", caption.slice(0, 1024));
   if (replyTo) form.append("reply_parameters", JSON.stringify({ message_id: replyTo }));
   if (threadId) form.append("message_thread_id", String(threadId));
-  form.append("document", new Blob([buffer], { type: "text/plain" }), filename);
+  form.append("document", new Blob([buffer], { type: mimeType || "text/plain" }), filename);
   try {
     const response = await fetch(`${TG_API}/bot${BOT_TOKEN}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
     const data = await response.json().catch(() => ({ ok: false }));
@@ -684,16 +611,11 @@ async function sendDocumentBuffer(chatId, buffer, filename, caption, replyTo, th
 
 // ---------------------------------------------------------------------------
 // Admin alerting
-//
-// Throttled DM to every configured admin when a request fails through the
-// *entire* model fallback chain (i.e. every model in chooseModelChain()
-// errored before a single token streamed back). Requires the admin to have
-// started a DM with the bot at least once (a standard Telegram limitation).
 // ---------------------------------------------------------------------------
 
 let lastAdminAlertAt = 0;
 async function alertAdmins(text) {
-  if (!ADMIN_IDS_PLACEHOLDER_GUARD()) return;
+  if (!ADMIN_IDS.size) return;
   const now = Date.now();
   if (now - lastAdminAlertAt < ADMIN_ALERT_COOLDOWN_MS) return;
   lastAdminAlertAt = now;
@@ -702,18 +624,9 @@ async function alertAdmins(text) {
     catch (error) { console.error(`[admin-alert:error] ${sanitizeLog(error?.message || error)}`); }
   }
 }
-// ADMIN_IDS is defined further down (near the command handlers) but alertAdmins
-// is used inside generate(), defined earlier — this tiny guard just avoids a
-// temporal-dead-zone reference error since ADMIN_IDS is a `const` declared
-// later in the file. It's called lazily (at alert time, not at module load).
-function ADMIN_IDS_PLACEHOLDER_GUARD() { return typeof ADMIN_IDS !== "undefined" && ADMIN_IDS.size > 0; }
 
 // ---------------------------------------------------------------------------
 // Rich Text block builders
-//
-// Small helpers that build InputRichBlock / RichText structures per the
-// Rich Message spec, so command handlers can compose real headings, lists,
-// dividers, and mentions instead of hand-escaped Markdown.
 // ---------------------------------------------------------------------------
 
 const rt = {
@@ -738,8 +651,6 @@ const rb = {
   pre: (text, language) => ({ type: "pre", text, language }),
 };
 
-// Flattens RichText (string | array | {type,text,...}) down to plain text,
-// used only as a last-resort fallback path.
 function richTextToPlain(node) {
   if (node == null) return "";
   if (typeof node === "string") return node;
@@ -827,13 +738,6 @@ function filePartFromDownload(file, fileName, declaredMime) {
 
 // ---------------------------------------------------------------------------
 // Direct URL Opening feature
-//
-// Detects direct http(s) links in a user's message, fetches the exact URL
-// (following redirects), and extracts readable content with a lightweight,
-// dependency-free, readability-oriented extractor suitable for a Cloudflare
-// Worker / Node runtime. This is intentionally independent from web search:
-// it never triggers a search by itself, and web search independently
-// decides (via its own tool-calling logic) whether it's also useful.
 // ---------------------------------------------------------------------------
 
 const URL_REGEX = /\bhttps?:\/\/[^\s<>"'`]+/gi;
@@ -847,9 +751,6 @@ function isSafeUrl(url) {
   } catch { return false; }
 }
 
-// Extracts clean, deduplicated http(s) URLs from free text, stripping
-// trailing punctuation (". , ! ? : ; ) ] }") that's clearly not part of the
-// URL, and rejecting any protocol other than http/https.
 function extractUrls(text) {
   const raw = String(text || "");
   const matches = raw.match(URL_REGEX) || [];
@@ -1182,8 +1083,7 @@ async function get_time(timezone = "Asia/Tehran") {
 }
 
 // ---------------------------------------------------------------------------
-// Reminders (persisted in SQLite; rehydrated on startup — see
-// rehydrateReminders() near the persistence section above)
+// Reminders
 // ---------------------------------------------------------------------------
 
 function scheduleReminderRow(row) {
@@ -1260,18 +1160,16 @@ async function ensureAudioModel(model) {
   return true;
 }
 
-// Builds the ordered list of text models to try for a request. Order is:
-// 1) TEXT_MODEL (the currently active primary — mutable via /models)
-// 2) FALLBACK_TEXT_MODEL (defaults to MiniMax M2.7, free)
-// 3) SECOND_FALLBACK_TEXT_MODEL (defaults to "openrouter/free", OpenRouter's
-//    own auto-router across whatever free models are currently healthy)
-// image/audio/file requests bypass the chain and go straight to their
-// dedicated single model, same as before.
-function chooseModelChain({ image, file, audio }) {
+// NEW: chooseModelChain now accepts an optional chatId so per-chat model
+// overrides (see setChatModelOverride/getChatModelOverride above) are
+// respected for text requests. Image/audio/file chains are unaffected —
+// those are dedicated single-purpose models, same as before.
+function chooseModelChain({ image, file, audio, chatId }) {
   if (image) return [VISION_MODEL];
   if (audio) return [AUDIO_MODEL];
   if (file) return [FILE_MODEL];
-  const chain = [TEXT_MODEL];
+  const primary = effectivePrimaryModel(chatId);
+  const chain = [primary];
   if (FALLBACK_TEXT_MODEL && !chain.includes(FALLBACK_TEXT_MODEL)) chain.push(FALLBACK_TEXT_MODEL);
   if (SECOND_FALLBACK_TEXT_MODEL && !chain.includes(SECOND_FALLBACK_TEXT_MODEL)) chain.push(SECOND_FALLBACK_TEXT_MODEL);
   return chain;
@@ -1288,10 +1186,6 @@ async function buildOpenRouterBody(messages, model, tools) {
   return body;
 }
 
-// combineSignals lets a single fetch respect BOTH the fixed request timeout
-// AND an externally-triggered cancellation (used by /cancel — see
-// activeGenerations). Falls back to a manual composite AbortController on
-// Node versions without AbortSignal.any.
 function combineSignals(...signals) {
   const valid = signals.filter(Boolean);
   if (valid.length === 1) return valid[0];
@@ -1312,7 +1206,7 @@ async function orRequest(messages, model, tools = null, externalSignal = null) {
   try {
     response = await fetch(OR_API, { method: "POST", headers: { authorization: `Bearer ${OR_KEY}`, "content-type": "application/json", ...(process.env.OPENROUTER_HTTP_REFERER ? { "HTTP-Referer": process.env.OPENROUTER_HTTP_REFERER } : {}), ...(process.env.OPENROUTER_X_TITLE ? { "X-Title": process.env.OPENROUTER_X_TITLE } : {}) }, body: JSON.stringify(body), signal });
   } catch (error) {
-    if (error?.name === "AbortError" && externalSignal?.aborted) throw error; // propagate cancellation as-is
+    if (error?.name === "AbortError" && externalSignal?.aborted) throw error;
     stats.openRouterErrors++;
     throw new Error(`OpenRouter request failed: ${error instanceof Error ? error.message : "network error"}`);
   }
@@ -1469,15 +1363,9 @@ function formatElapsed(seconds) {
   const total = Math.max(0, Math.floor(seconds)), m = Math.floor(total / 60), s = total % 60;
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
-// Ensures a stage label always ends in exactly three dots ("Thinking" and
-// "Thinking..." both become "Thinking...") — strips any existing trailing
-// dots first so it's never doubled up into "......".
 function withEllipsis(stage) {
   return String(stage ?? "").replace(/\.*$/, "...");
 }
-// One <tg-thinking> element = one bubble, but a line break inside it renders
-// fine — so the stage label goes on its own line (always ending in "...")
-// and the running timer goes on the line right below it.
 function statusWithTimerHtml(stage, elapsedSeconds) {
   return `<tg-thinking>${escHtml(withEllipsis(stage))}<br>${escHtml(formatElapsed(elapsedSeconds))}</tg-thinking>`;
 }
@@ -1524,30 +1412,13 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
   const stopStatus = () => { statusVersion++; if (statusTimer) clearInterval(statusTimer); statusTimer = null; };
 
   try {
-    modelChain = chooseModelChain({ image: Boolean(images?.length), file: Boolean(file), audio: Boolean(audio) });
+    modelChain = chooseModelChain({ image: Boolean(images?.length), file: Boolean(file), audio: Boolean(audio), chatId });
     if (images?.length) await ensureImageModel(modelChain[0]);
     if (audio) await ensureAudioModel(modelChain[0]);
 
     console.log(`[request] chat=${chatId} user=${userId} models=${sanitizeLog(modelChain.join(" -> "))} images=${images?.length || 0} file=${Boolean(file)} audio=${Boolean(audio)}`);
 
     if (!isPrivate) {
-      // BUG 1 fix: thinkingHtml() returns HTML (<tg-thinking>...</tg-thinking>),
-      // so it must be sent through the HTML-aware sender. sendRichMessage()
-      // treats its argument as Markdown (and falls back to parse_mode
-      // MarkdownV2), so passing HTML there printed the tag text literally.
-      //
-      // BUG 4 fix ("in groups it always says ❌ I could not complete that
-      // request"): sendRichMessageHtml() has NO fallback of its own — unlike
-      // sendRichMessage() (the Markdown version used elsewhere), which
-      // silently degrades to plain parse_mode MarkdownV2 when the Rich
-      // Message API call is rejected. In a group, if "sendRichMessage" is
-      // ever unavailable/rejected for the placeholder (feature disabled for
-      // that chat, older client, transient Telegram error, ...), the old
-      // code threw immediately — before a single token was generated —
-      // which always landed in the generic catch-all error message, every
-      // single time, for every group message. Give it the same plain-text
-      // fallback the private-chat draft path already has below, instead of
-      // throwing.
       let placeholder = await sendRichMessageHtml(chatId, thinkingHtml("Thinking"), replyTo, threadExtra(threadId));
       if (!placeholder?.ok || !placeholder?.result?.message_id) {
         console.warn(`[group:placeholder-fallback] chat=${chatId} reason=${sanitizeLog(placeholder?.description || "rich message unavailable")}`);
@@ -1569,12 +1440,6 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
     typingTimer = setInterval(() => typing(chatId).catch(() => {}), TYPING_MS);
     typingTimer.unref?.();
 
-    // --- Direct URL Opening: independent of web search. If the user's text
-    // contains a direct http(s) link, open it now (status: "Opening link"),
-    // before building the messages, so the extracted content can be handed
-    // to the model as a dedicated context message. Only applies to plain
-    // text/file-text messages — image, audio, and document uploads are
-    // unaffected.
     let urlContext = null;
     if (!(images?.length) && !file && !audio) {
       const detectedUrls = extractUrls(prompt);
@@ -1600,9 +1465,6 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
 
     for (let mi = 0; mi < modelChain.length; mi++) {
       finalModel = modelChain[mi];
-      // --- Terminal-only log: which model is actively being used for this
-      // request/attempt. This is printed to the server console (stdout),
-      // never sent to the chat.
       console.log(`[model-used] chat=${chatId} user=${userId} model=${finalModel} attempt=${mi + 1}/${modelChain.length}`);
       messages = baseMessages.slice();
       full = "";
@@ -1638,13 +1500,6 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
                   if (useRichDraft) {
                     const richResult = await sendRichMessageDraft(chatId, draftIdValue, preview);
                     if (!richResult.ok) {
-                      // BUG 3: this used to be swallowed unconditionally, which
-                      // hid Telegram 429s (rate limits) behind a silent no-op —
-                      // making dropped/delayed edits look like random "jumps"
-                      // in the streamed text with no trace in the logs. Now we
-                      // log the failure reason (unless it's just Telegram
-                      // catching up, which is normal) so a real rate-limit
-                      // problem is visible instead of invisible.
                       if (!/flood|too many requests|retry/i.test(String(richResult?.description || ""))) {
                         console.warn(`[stream:draft-edit-failed] chat=${chatId} user=${userId} reason=${sanitizeLog(richResult?.description || "unknown")}`);
                       }
@@ -1690,7 +1545,7 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
         }
         break;
       } catch (error) {
-        if (error?.name === "AbortError" && activeGenerations.get(genKey)?.cancelled) throw error; // don't fall through models on a user cancel
+        if (error?.name === "AbortError" && activeGenerations.get(genKey)?.cancelled) throw error;
         if (firstTokenRecorded || mi === modelChain.length - 1) throw error;
         console.warn(`[fallback] model=${sanitizeLog(finalModel)} failed (${sanitizeLog(error?.message || error)}), trying next model`);
         continue;
@@ -1737,10 +1592,6 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
     const publicMessage = wasCancelled ? "🛑 Generation cancelled." : userFacingError(error);
     console.error(`[generate:error] chat=${chatId} user=${userId} model=${sanitizeLog(finalModel || "unknown")} status=${error?.status || "n/a"} cancelled=${wasCancelled} message=${sanitizeLog(error?.message || error)}`);
 
-    // If every model in the chain was attempted and none produced a token,
-    // this was a full-chain failure (not just a mid-stream hiccup or a user
-    // cancellation) — let admins know, throttled to at most once per
-    // ADMIN_ALERT_COOLDOWN_MS so a bad model doesn't spam them.
     if (!wasCancelled && !full.trim()) {
       alertAdmins(`Generation fully failed for user ${userId} in chat ${chatId}. Model chain: ${modelChain.join(" → ") || "unknown"}. Error: ${sanitizeLog(error?.message || error)}`).catch(() => {});
     }
@@ -1815,8 +1666,7 @@ function splitText(text, limit) {
 }
 
 // ---------------------------------------------------------------------------
-// Guest Calling Mode (unchanged behavior from the base bot, now with Direct
-// URL Opening support too, for parity with the main chat flow)
+// Guest Calling Mode
 // ---------------------------------------------------------------------------
 
 async function generateGuestAnswer(guestUserId, prompt) {
@@ -1919,7 +1769,7 @@ async function handleGuestMessage(token, update) {
 }
 
 // ---------------------------------------------------------------------------
-// Commands — rendered with native Rich Text blocks
+// Commands
 // ---------------------------------------------------------------------------
 
 function displayName(user) {
@@ -1963,11 +1813,6 @@ function helpBlocks() {
     rb.bulletList([
       "In a private chat, just send a normal message.",
       `In a group, mention me, reply to me, or use "${TRIGGER || "!ai"}".`,
-      // Slash-command alternative documented explicitly: Telegram group
-      // "privacy mode" (a per-bot setting in @BotFather) prevents plain
-      // text triggers like "!ai" from ever reaching the bot unless the
-      // bot is mentioned/replied-to — but "/" commands are always
-      // delivered regardless of privacy mode. See SLASH_TRIGGER below.
       `If "${TRIGGER || "!ai"}" doesn't seem to work in a group, use "${SLASH_TRIGGER}" instead — it works even when the bot's group privacy mode is on.`,
       "I reply in whatever language you write in.",
       "/cancel — stop the response I'm currently generating for you."
@@ -1977,6 +1822,7 @@ function helpBlocks() {
       `I keep the most recent ${HISTORY_PAIRS} conversation pair${HISTORY_PAIRS === 1 ? "" : "s"} per user, saved to disk so it survives a restart.`,
       "/clear — clear your conversation history.",
       "/persona <text> — give me a custom personality or house style, just for you.",
+      "/persona list — pick from a few ready-made personas.",
       "/persona (no text) — show your current persona.",
       "Editing a message you sent regenerates the answer in place."
     ]),
@@ -1994,6 +1840,7 @@ function helpBlocks() {
       "/export — download your conversation history as a text file.",
       "/settings — quick-access buttons for memory & persona.",
       "/status or /stats — runtime statistics.",
+      "/usage — your personal usage stats (requests, searches, models used).",
       "/models — active AI models, and switch the primary one.",
     ]),
     rb.footer("Tip: /help shows this guide again any time.")
@@ -2042,13 +1889,44 @@ function statusBlocks(admin = false) {
   return blocks;
 }
 
-// Renders /models with the full live fallback order (so users can see
-// exactly what will be tried, in order, if a model is unavailable or
-// rate-limited), followed by the raw model IDs in inline code, and a
-// tappable list of every catalog entry to pick a new primary model from.
-function modelsBlocks(canChange) {
-  const chain = chooseModelChain({ image: false, file: false, audio: false });
+// NEW: /usage — a regular (non-admin) user can see their own request count,
+// searches used, and which models they've been served by, pulled straight
+// from the usage table already being written in recordUsage().
+function usageBlocks(userId) {
+  const row = getUsage(userId);
+  if (!row) return [rb.paragraph("You haven't made any requests yet — send me a message to get started!")];
+  let models = {};
+  try { models = JSON.parse(row.models_json || "{}"); } catch {}
+  const modelLines = Object.entries(models)
+    .sort((a, b) => b[1] - a[1])
+    .map(([id, count]) => `${FREE_MODELS.find(m => m.id === id)?.label || id}: ${count}`);
+  return [
+    rb.heading("📈 Your usage", 3),
+    rb.bulletList([
+      `Total requests: ${row.requests}`,
+      `Web searches used: ${row.searches}`,
+      `Last active: ${row.last_active ? new Date(row.last_active).toISOString() : "—"}`
+    ]),
+    rb.divider(),
+    rb.heading("Models you've used", 4),
+    ...(modelLines.length ? [rb.bulletList(modelLines)] : [rb.paragraph("No model breakdown yet.")])
+  ];
+}
+
+function modelsBlocks(canChange, chatId) {
+  const chain = chooseModelChain({ image: false, file: false, audio: false, chatId });
   const labelFor = (id) => FREE_MODELS.find(m => m.id === id)?.label || id;
+  const override = chatId != null ? getChatModelOverride(chatId) : "";
+
+  const bullets = [
+    [rt.bold("Primary (global): "), rt.code(TEXT_MODEL)],
+    [rt.bold("Fallback 1: "), rt.code(FALLBACK_TEXT_MODEL)],
+    [rt.bold("Fallback 2: "), rt.code(SECOND_FALLBACK_TEXT_MODEL)],
+    [rt.bold("Vision: "), rt.code(VISION_MODEL)],
+    [rt.bold("Files: "), rt.code(FILE_MODEL)],
+    [rt.bold("Audio: "), rt.code(AUDIO_MODEL)]
+  ];
+  if (override) bullets.splice(1, 0, [rt.bold("This chat's override: "), rt.code(override)]);
 
   return [
     rb.heading("🤖 Active models", 3),
@@ -2059,30 +1937,24 @@ function modelsBlocks(canChange) {
     })),
     rb.divider(),
     rb.heading("Model IDs", 4),
-    rb.bulletList([
-      [rt.bold("Primary: "), rt.code(TEXT_MODEL)],
-      [rt.bold("Fallback 1: "), rt.code(FALLBACK_TEXT_MODEL)],
-      [rt.bold("Fallback 2: "), rt.code(SECOND_FALLBACK_TEXT_MODEL)],
-      [rt.bold("Vision: "), rt.code(VISION_MODEL)],
-      [rt.bold("Files: "), rt.code(FILE_MODEL)],
-      [rt.bold("Audio: "), rt.code(AUDIO_MODEL)]
-    ]),
+    rb.bulletList(bullets),
     rb.divider(),
-    rb.footer(canChange ? "Tap a model below to make it the new primary model." : "Only admins can change the primary model.")
+    rb.footer(canChange ? "Tap a model below to set it as this chat's primary model." : "Only admins can change the primary model.")
   ];
 }
 
-// "Glassy" pill-style inline keyboard: a translucent-looking frame (◇/✦) around
-// each label, one model per row, with the active model marked and disabled
-// (re-tapping the current model is a no-op, so we grey it out instead).
-// Admins additionally get a "🔄 Refresh catalog" row to force-pull the
-// OpenRouter model list without waiting for the 10-minute cache to expire.
-function modelsKeyboard(canChange) {
+// NEW: model buttons now write a per-chat override (via callback_data
+// "model:<index>:<chatId>") instead of always changing the single global
+// TEXT_MODEL, so different chats can run different primary models.
+function modelsKeyboard(canChange, chatId) {
+  const override = chatId != null ? getChatModelOverride(chatId) : "";
+  const active = override || TEXT_MODEL;
   const rows = FREE_MODELS.map((model, index) => {
-    const active = model.id === TEXT_MODEL;
-    const label = active ? `✅ ✦ ${model.label} ✦` : `◇ ${model.label} ◇`;
-    return [{ text: label, callback_data: active ? "model:noop" : `model:${index}` }];
+    const isActive = model.id === active;
+    const label = isActive ? `✅ ✦ ${model.label} ✦` : `◇ ${model.label} ◇`;
+    return [{ text: label, callback_data: isActive ? "model:noop" : `model:${index}:${chatId}` }];
   });
+  if (override) rows.push([{ text: "↩️ Reset to global default", callback_data: `model:reset:${chatId}` }]);
   if (canChange) rows.push([{ text: "🔄 Refresh catalog", callback_data: "model:refresh" }]);
   return { inline_keyboard: rows };
 }
@@ -2090,26 +1962,16 @@ function modelsKeyboard(canChange) {
 function settingsKeyboard(isAdmin = false) {
   const rows = [
     [{ text: "◇ 🧹 Clear memory ◇", callback_data: "settings:clear" }, { text: "◇ 🎭 Show persona ◇", callback_data: "settings:persona" }],
-    [{ text: "◇ 📤 Export history ◇", callback_data: "settings:export" }, { text: "◇ 🤖 Models ◇", callback_data: "settings:models" }]
+    [{ text: "◇ 📤 Export history ◇", callback_data: "settings:export" }, { text: "◇ 🤖 Models ◇", callback_data: "settings:models" }],
+    [{ text: "◇ 🎭 Persona presets ◇", callback_data: "settings:personapresets" }, { text: "◇ 📈 My usage ◇", callback_data: "settings:usage" }]
   ];
   if (isAdmin) rows.push([{ text: "✦ 🛠 Admin panel ✦", callback_data: "settings:openadmin" }]);
   return { inline_keyboard: rows };
 }
 
-const ADMIN_IDS = new Set(String(process.env.ADMIN_IDS || "").split(",").map(v => v.trim()).filter(Boolean));
-
 // ---------------------------------------------------------------------------
-// Admin panel — a single glassy-pill button dashboard (/admin, /dev) that
-// replaces the old plain "dump some stats text" admin command. Every button
-// is either a quick action (toggle voice, refresh catalog, clear cache) that
-// applies instantly and re-renders the panel, or an info button that answers
-// with a popup (answerCallbackQuery show_alert) so it never spams the chat
-// with extra messages. Broadcasting still goes through the /broadcast text
-// command (Telegram has no way to collect free text from an inline button),
-// but the panel button reminds admins how to use it.
+// Admin panel
 // ---------------------------------------------------------------------------
-
-function isAdminId(userId) { return ADMIN_IDS.has(String(userId)); }
 
 function adminPanelKeyboard() {
   const voiceLabel = voiceEnabled ? "✅ ✦ Voice: ON ✦" : "◇ 🎙 Voice: OFF ◇";
@@ -2120,6 +1982,7 @@ function adminPanelKeyboard() {
       [{ text: "◇ ⏰ Reminders ◇", callback_data: "admin:reminders" }, { text: "◇ ⚡ Active jobs ◇", callback_data: "admin:jobs" }],
       [{ text: voiceLabel, callback_data: "admin:togglevoice" }, { text: "◇ 🎚 Rate limits ◇", callback_data: "admin:ratelimits" }],
       [{ text: "◇ 🧹 Clear cache ◇", callback_data: "admin:clearcache" }, { text: "◇ 📣 Broadcast ◇", callback_data: "admin:broadcast" }],
+      [{ text: "◇ 📦 Backup DB ◇", callback_data: "admin:backup" }],
       [{ text: "✖ Close", callback_data: "admin:close" }]
     ]
   };
@@ -2127,6 +1990,23 @@ function adminPanelKeyboard() {
 
 async function sendAdminPanel(chatId, messageId, threadId) {
   await sendRichBlocksMessage(chatId, statusBlocks(true), messageId, { reply_markup: adminPanelKeyboard(), ...threadExtra(threadId) });
+}
+
+// NEW: sends the live SQLite DB file to the requesting admin as a document,
+// so there's a one-tap backup path instead of needing shell/SSH access to
+// the deploy host. Uses WAL checkpoint first so the on-disk file reflects
+// the latest writes (WAL mode can otherwise leave recent data only in the
+// -wal sidecar file).
+async function backupDatabase(chatId, messageId, threadId) {
+  try {
+    try { db.exec("PRAGMA wal_checkpoint(FULL);"); } catch (error) { console.warn(`[backup:checkpoint-warn] ${sanitizeLog(error?.message || error)}`); }
+    const buffer = fs.readFileSync(DB_PATH);
+    const filename = `bot-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.db`;
+    const result = await sendDocumentBuffer(chatId, buffer, filename, "📦 SQLite database backup.", messageId, threadId, "application/octet-stream");
+    if (!result.ok) await sendRichBlocksMessage(chatId, [rb.paragraph(`❌ Backup failed: ${sanitizeLog(result.description || "unknown error")}`)], messageId, threadExtra(threadId));
+  } catch (error) {
+    await sendRichBlocksMessage(chatId, [rb.paragraph(`❌ Backup failed: ${error instanceof Error ? error.message : "unknown error"}`)], messageId, threadExtra(threadId));
+  }
 }
 
 async function exportHistory(chatId, userId, messageId, threadId) {
@@ -2182,12 +2062,16 @@ async function command(chatId, userId, text, messageId, fromUser, threadId) {
         const current = getPersona(userId);
         await sendRichBlocksMessage(chatId, current
           ? [rb.heading("🎭 Your current persona", 4), rb.blockquote([rb.paragraph(current)])]
-          : [rb.paragraph("You don't have a custom persona set. Use /persona <text> to set one.")], messageId, threadExtra(threadId));
+          : [rb.paragraph("You don't have a custom persona set. Use /persona <text> to set one, or /persona list to pick a preset.")], messageId, threadExtra(threadId));
         return true;
       }
       if (/^(clear|reset|off|none)$/i.test(parsed.arg)) {
         setPersona(userId, "");
         await sendRichBlocksMessage(chatId, [rb.paragraph("🎭 Persona cleared — back to default.")], messageId, threadExtra(threadId));
+        return true;
+      }
+      if (/^list$/i.test(parsed.arg)) {
+        await tg("sendMessage", { chat_id: chatId, text: "🎭 Pick a persona preset:", reply_markup: personaPresetsKeyboard(), ...(messageId ? { reply_parameters: { message_id: messageId } } : {}), ...threadExtra(threadId) });
         return true;
       }
       const saved = setPersona(userId, parsed.arg);
@@ -2226,24 +2110,18 @@ async function command(chatId, userId, text, messageId, fromUser, threadId) {
       await sendRichBlocksMessage(chatId, statusBlocks(false), messageId, threadExtra(threadId));
       return true;
 
+    case "/usage":
+      await sendRichBlocksMessage(chatId, usageBlocks(userId), messageId, threadExtra(threadId));
+      return true;
+
     case "/models": {
-      const canChange = !ADMIN_IDS.size || ADMIN_IDS.has(String(userId));
-      await sendRichBlocksMessage(chatId, modelsBlocks(canChange), messageId, { reply_markup: modelsKeyboard(canChange), ...threadExtra(threadId) });
+      const canChange = !ADMIN_IDS.size || isAdminId(userId);
+      await sendRichBlocksMessage(chatId, modelsBlocks(canChange, chatId), messageId, { reply_markup: modelsKeyboard(canChange, chatId), ...threadExtra(threadId) });
       return true;
     }
 
-    // /ai <prompt> — slash-command twin of the "!ai" text trigger (see
-    // SLASH_TRIGGER / BUG 2 notes). Handled here in the command() dispatcher
-    // (which only fires on non-edited messages) so it's always delivered by
-    // Telegram regardless of the bot's group privacy-mode setting, unlike
-    // the plain-text "!ai" trigger which privacy mode can block entirely.
-    case "/ai": {
-      // Returning false lets handleSingleUpdate() fall through to the normal
-      // generation path below, with parsed.arg as the effective prompt (via
-      // stripTargeting()/slashTriggerUsed() further down). We only need to
-      // special-case here when there's no argument at all.
+    case "/ai":
       return false;
-    }
 
     default:
       return false;
@@ -2251,7 +2129,7 @@ async function command(chatId, userId, text, messageId, fromUser, threadId) {
 }
 
 async function adminCommand(chatId, userId, text, messageId, threadId) {
-  if (!ADMIN_IDS.has(String(userId))) return false;
+  if (!isAdminId(userId)) return false;
   const parsed = parseCommand(text);
   if (!parsed) return false;
 
@@ -2264,6 +2142,10 @@ async function adminCommand(chatId, userId, text, messageId, threadId) {
     case "/clearcache":
       clearAllCache();
       await sendRichBlocksMessage(chatId, [rb.paragraph([rt.bold("🧹 Cache and in-memory state cleared.")])], messageId, threadExtra(threadId));
+      return true;
+
+    case "/backup":
+      await backupDatabase(chatId, messageId, threadId);
       return true;
 
     case "/broadcast": {
@@ -2280,7 +2162,7 @@ async function adminCommand(chatId, userId, text, messageId, threadId) {
           const result = await sendRichMessage(row.chat_id, parsed.arg, undefined);
           if (result.ok) sent++; else failed++;
         } catch { failed++; }
-        await sleep(60); // gentle pacing to stay well under Telegram's flood limits
+        await sleep(60);
       }
       await sendRichBlocksMessage(chatId, [rb.paragraph(`✅ Broadcast done: ${sent} sent, ${failed} failed.`)], messageId, threadExtra(threadId));
       return true;
@@ -2309,6 +2191,16 @@ async function handleCallbackQuery(callbackQuery) {
     await answerCallbackQuery(callbackQuery.id, persona ? persona.slice(0, 190) : "No custom persona set.", true);
     return;
   }
+  if (data === "settings:personapresets") {
+    await answerCallbackQuery(callbackQuery.id);
+    await tg("sendMessage", { chat_id: chatId, text: "🎭 Pick a persona preset:", reply_markup: personaPresetsKeyboard(), ...threadExtra(threadId) });
+    return;
+  }
+  if (data === "settings:usage") {
+    await answerCallbackQuery(callbackQuery.id);
+    await sendRichBlocksMessage(chatId, usageBlocks(userId), messageId, threadExtra(threadId));
+    return;
+  }
   if (data === "settings:export") {
     await answerCallbackQuery(callbackQuery.id, "Exporting your history…");
     await exportHistory(chatId, userId, messageId, threadId);
@@ -2317,7 +2209,7 @@ async function handleCallbackQuery(callbackQuery) {
   if (data === "settings:models") {
     await answerCallbackQuery(callbackQuery.id);
     const canChange = !ADMIN_IDS.size || isAdminId(userId);
-    await sendRichBlocksMessage(chatId, modelsBlocks(canChange), messageId, { reply_markup: modelsKeyboard(canChange), ...threadExtra(threadId) });
+    await sendRichBlocksMessage(chatId, modelsBlocks(canChange, chatId), messageId, { reply_markup: modelsKeyboard(canChange, chatId), ...threadExtra(threadId) });
     return;
   }
   if (data === "settings:openadmin") {
@@ -2327,12 +2219,18 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
-  // -------------------------------------------------------------------
-  // Admin panel button handlers (see adminPanelKeyboard()). Every branch
-  // here is gated by isAdminId() first, even though non-admins can't
-  // normally see the panel — a stale/forwarded callback_data shouldn't be
-  // trusted just because it looks like one of ours.
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // Persona preset selection (from /persona list or settings menu)
+  // -----------------------------------------------------------------
+  if (data.startsWith("persona:")) {
+    const presetId = data.slice("persona:".length);
+    const preset = findPersonaPreset(presetId);
+    if (!preset) { await answerCallbackQuery(callbackQuery.id, "Unknown preset.", true); return; }
+    setPersona(userId, preset.text);
+    await answerCallbackQuery(callbackQuery.id, preset.text ? `🎭 Persona set to: ${preset.label}` : "🎭 Persona reset to default.");
+    return;
+  }
+
   if (data.startsWith("admin:")) {
     if (!isAdminId(userId)) { await answerCallbackQuery(callbackQuery.id, "Admins only.", true); return; }
     const action = data.slice("admin:".length);
@@ -2375,7 +2273,7 @@ async function handleCallbackQuery(callbackQuery) {
 
     if (action === "models") {
       await answerCallbackQuery(callbackQuery.id);
-      await sendRichBlocksMessage(chatId, modelsBlocks(true), messageId, { reply_markup: modelsKeyboard(true), ...threadExtra(threadId) });
+      await sendRichBlocksMessage(chatId, modelsBlocks(true, chatId), messageId, { reply_markup: modelsKeyboard(true, chatId), ...threadExtra(threadId) });
       return;
     }
 
@@ -2439,6 +2337,12 @@ async function handleCallbackQuery(callbackQuery) {
       return;
     }
 
+    if (action === "backup") {
+      await answerCallbackQuery(callbackQuery.id, "📦 Preparing backup…");
+      await backupDatabase(chatId, messageId, threadId);
+      return;
+    }
+
     await answerCallbackQuery(callbackQuery.id);
     return;
   }
@@ -2448,30 +2352,43 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
   if (data === "model:refresh") {
-    const canChange = !ADMIN_IDS.size || ADMIN_IDS.has(String(userId));
+    const canChange = !ADMIN_IDS.size || isAdminId(userId);
     if (!canChange) { await answerCallbackQuery(callbackQuery.id, "Only admins can refresh the catalog.", true); return; }
     await answerCallbackQuery(callbackQuery.id, "Refreshing model catalog…");
     await fetchModelCatalog(true);
-    if (messageId) await tg("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: modelsKeyboard(canChange) }).catch(() => {});
+    if (messageId) await tg("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: modelsKeyboard(canChange, chatId) }).catch(() => {});
+    return;
+  }
+  if (data.startsWith("model:reset:")) {
+    const targetChatId = data.slice("model:reset:".length);
+    const canChange = !ADMIN_IDS.size || isAdminId(userId);
+    if (!canChange) { await answerCallbackQuery(callbackQuery.id, "Only admins can change the primary model.", true); return; }
+    setChatModelOverride(targetChatId, "");
+    await answerCallbackQuery(callbackQuery.id, "↩️ Reset to the global default model.");
+    if (messageId) await tg("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: modelsKeyboard(canChange, chatId) }).catch(() => {});
     return;
   }
   if (data.startsWith("model:")) {
-    const canChange = !ADMIN_IDS.size || ADMIN_IDS.has(String(userId));
+    const canChange = !ADMIN_IDS.size || isAdminId(userId);
     if (!canChange) {
       await answerCallbackQuery(callbackQuery.id, "Only admins can change the primary model.", true);
       return;
     }
-    const index = Number(data.slice("model:".length));
+    // format: model:<index>:<chatId>
+    const rest = data.slice("model:".length);
+    const [indexStr, targetChatIdStr] = rest.split(":");
+    const index = Number(indexStr);
     const model = Number.isInteger(index) ? FREE_MODELS[index] : null;
     if (!model) {
       await answerCallbackQuery(callbackQuery.id, "Unknown model.", true);
       return;
     }
-    TEXT_MODEL = model.id;
-    console.log(`[models] primary model switched to ${sanitizeLog(model.id)} by user=${sanitizeLog(userId)}`);
-    await answerCallbackQuery(callbackQuery.id, `✅ Primary model set to ${model.label}`);
+    const targetChatId = targetChatIdStr || chatId;
+    setChatModelOverride(targetChatId, model.id);
+    console.log(`[models] chat=${sanitizeLog(targetChatId)} primary model switched to ${sanitizeLog(model.id)} by user=${sanitizeLog(userId)}`);
+    await answerCallbackQuery(callbackQuery.id, `✅ This chat's primary model set to ${model.label}`);
     if (messageId) {
-      await tg("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: modelsKeyboard(canChange) }).catch(() => {});
+      await tg("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: modelsKeyboard(canChange, chatId) }).catch(() => {});
     }
     return;
   }
@@ -2491,38 +2408,8 @@ function triggerUsed(text) {
   const source = String(text || "").trim(), lower = source.toLowerCase(), trigger = TRIGGER.toLowerCase();
   return lower === trigger || lower.startsWith(`${trigger} `);
 }
-// ---------------------------------------------------------------------------
-// BUG 2 — "!ai" appearing not to work in groups.
-//
-// triggerUsed() above is, and always was, correct: "!ai", "!ai hello", any
-// case variant, and leading/trailing whitespace are all matched properly.
-// The actual cause lives outside this file's logic entirely: Telegram's
-// per-bot "group privacy mode" (@BotFather -> /mybots -> your bot -> Bot
-// Settings -> Group Privacy).
-//
-// When group privacy mode is ENABLED (Telegram's default for newly created
-// bots), Telegram does NOT forward ordinary group text messages to the
-// bot's webhook AT ALL — it only forwards messages that are "/"-commands,
-// @mentions of the bot, or direct replies to the bot's own messages. Since
-// "!ai ..." is plain text (not a "/" command), the update never reaches
-// handleUpdate()/handleSingleUpdate() in the first place when privacy mode
-// is on — no amount of fixing triggerUsed() can help, because this code
-// never runs for that update.
-//
-// Fix options (both provided):
-//   1. Disable group privacy mode in @BotFather, then remove and re-add the
-//      bot to the affected group (privacy-mode changes only apply to groups
-//      the bot re-joins after the change).
-//   2. Use SLASH_TRIGGER ("/ai ...") instead of "!ai ..." — "/" commands are
-//      ALWAYS delivered to the bot regardless of privacy mode, so this works
-//      without touching BotFather settings. This is registered in
-//      registerCommands() and documented in /help.
-//
-// Do not "fix" this again by rewriting triggerUsed()/stripTargeting() —
-// they are not the bug.
-// ---------------------------------------------------------------------------
 const SLASH_TRIGGER = "/" + TRIGGER.replace(/^!+/, "").trim().split(/\s+/)[0].toLowerCase();
-console.log(`[trigger] text trigger="${TRIGGER}" slash trigger="${SLASH_TRIGGER}" (use the slash form in groups if privacy mode is enabled — see BUG 2 notes above triggerUsed())`);
+console.log(`[trigger] text trigger="${TRIGGER}" slash trigger="${SLASH_TRIGGER}" (use the slash form in groups if privacy mode is enabled)`);
 function slashTriggerUsed(text) {
   const source = String(text || "").trim();
   const parsed = parseCommand(source);
@@ -2548,9 +2435,6 @@ function stripTargeting(text) {
   return result;
 }
 
-// Buffers messages sharing a media_group_id (a Telegram "album") for a short
-// window before handing the whole batch to the caller, so a multi-photo send
-// becomes one generation request instead of several independent ones.
 function bufferMediaGroup(message, onReady) {
   const groupId = message.media_group_id;
   let group = mediaGroups.get(groupId);
@@ -2621,9 +2505,6 @@ async function handleUpdate(update) {
   const isEdited = Boolean(update?.edited_message);
   if (!message?.chat) return;
 
-  // Photo albums ("media groups") are buffered briefly and processed as one
-  // batch — see bufferMediaGroup()/processAlbumMessages(). Only applies to
-  // fresh (non-edited) photo messages that carry a media_group_id.
   if (!isEdited && message.media_group_id && Array.isArray(message.photo) && message.photo.length) {
     bufferMediaGroup(message, (messages) => {
       processAlbumMessages(messages).catch(error => console.error(`[album:error] ${sanitizeLog(error?.message || error)}`));
@@ -2790,7 +2671,6 @@ function processGuestUpdate(update) { return withGlobalConcurrency(() => handleG
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function createRichDraftId() { return (globalThis.crypto.getRandomValues(new Uint32Array(1))[0] || 1); }
 function esc(value) { return String(value ?? "").replace(/[_*\[\]()~`>#+\-=|{}.!\\]/g, "\\$&"); }
-function escCode(value) { return String(value ?? "").replace(/[`\\]/g, "\\$&"); }
 function escapeRegExp(value) { return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 function sanitizeLog(value) { return String(value ?? "").replace(/[\r\n]+/g, " ").replace(/\s{2,}/g, " ").slice(0, 500); }
 function detectRtl(text) {
@@ -2894,17 +2774,12 @@ const server = app.listen(PORT, async () => {
     console.error(`Telegram startup check failed: ${sanitizeLog(error?.message || error)}`);
   }
   registerCommands().catch(error => console.error(`[commands:error] ${sanitizeLog(error?.message || error)}`));
+  registerWebhook().catch(error => console.error(`[webhook:error] ${sanitizeLog(error?.message || error)}`));
   fetchModelCatalog(false).catch(() => {});
 });
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown
-//
-// Stops accepting new webhook/guest work immediately, lets in-flight jobs
-// finish (up to SHUTDOWN_DRAIN_TIMEOUT_MS), then closes the DB and exits.
-// Reminders are already persisted continuously in SQLite (see
-// scheduleReminder()), so a restart naturally rehydrates them via
-// rehydrateReminders() — nothing extra needs to happen for those here.
 // ---------------------------------------------------------------------------
 
 async function shutdown(signal) {
