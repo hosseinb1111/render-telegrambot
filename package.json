@@ -1,17 +1,16 @@
 {
   "name": "telegram-ai-bot",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Telegram AI bot (OpenRouter + LangSearch) for Render",
   "type": "module",
   "main": "index.js",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.5.0"
   },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "better-sqlite3": "^9.0.0"
+    "express": "^4.19.2"
   }
 }
