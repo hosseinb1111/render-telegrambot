@@ -195,6 +195,12 @@ const HISTORY_PAIRS = clampInt(process.env.HISTORY_PAIRS, 4, 1, 20),
   ENABLE_VOICE = String(process.env.ENABLE_VOICE_TRANSCRIPTION || "false").toLowerCase() === "true",
   WEBHOOK_PATH = WEBHOOK_PATH_TOKEN ? `/webhook/${WEBHOOK_PATH_TOKEN}` : "/webhook/UNCONFIGURED";
 
+// Runtime-toggleable mirror of ENABLE_VOICE (see admin panel: "Voice" button).
+// ENABLE_VOICE above stays as the env-derived startup default; voiceEnabled is
+// what the rest of the code actually checks, so an admin can flip it live
+// without a redeploy, same spirit as TEXT_MODEL.
+let voiceEnabled = ENABLE_VOICE;
+
 let botId = null, modelCatalog = null, modelCatalogLoadedAt = 0, modelCatalogAttemptedAt = 0, botInfo = null;
 
 function configWarnings() {
@@ -275,6 +281,7 @@ const userUpsertStmt = db.prepare(`INSERT INTO users (user_id, chat_id, username
   ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id, username = excluded.username, last_seen = excluded.last_seen`);
 const usersDistinctChatsStmt = db.prepare(`SELECT DISTINCT chat_id FROM users`);
 const usersCountStmt = db.prepare(`SELECT COUNT(*) AS c FROM users`);
+const usersRecentStmt = db.prepare(`SELECT user_id, username, last_seen FROM users ORDER BY last_seen DESC LIMIT 10`);
 
 const usageSelectStmt = db.prepare(`SELECT * FROM usage WHERE user_id = ?`);
 const usageUpsertStmt = db.prepare(`INSERT INTO usage (user_id, requests, searches, models_json, last_active) VALUES (?, 1, ?, ?, ?)
@@ -1206,6 +1213,16 @@ function scheduleReminder(chatId, userId, minutes, text, replyTo, threadId) {
   return row;
 }
 
+function cancelReminder(id) {
+  const idx = reminders.findIndex(r => r.id === id);
+  if (idx === -1) return false;
+  const row = reminders[idx];
+  try { clearTimeout(row.timer); } catch {}
+  reminders.splice(idx, 1);
+  try { reminderDeleteStmt.run(id); } catch (error) { console.error(`[db:reminderCancel:error] ${sanitizeLog(error?.message || error)}`); }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // OpenRouter model catalog / requests
 // ---------------------------------------------------------------------------
@@ -1496,7 +1513,7 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
       } else if (streamMessageId) {
         groupEditChain = groupEditChain.then(async () => {
           if (generationStarted || version !== statusVersion) return;
-          await editMessageRichHtml(chatId, streamMessageId, html).catch(() => {});
+          if (useRichDraft) await editMessageRichHtml(chatId, streamMessageId, html).catch(() => {});
         });
       }
     };
@@ -1518,7 +1535,24 @@ async function generate({ chatId, userId, prompt, images, file, fileText, audio,
       // so it must be sent through the HTML-aware sender. sendRichMessage()
       // treats its argument as Markdown (and falls back to parse_mode
       // MarkdownV2), so passing HTML there printed the tag text literally.
-      const placeholder = await sendRichMessageHtml(chatId, thinkingHtml("Thinking"), replyTo, threadExtra(threadId));
+      //
+      // BUG 4 fix ("in groups it always says ❌ I could not complete that
+      // request"): sendRichMessageHtml() has NO fallback of its own — unlike
+      // sendRichMessage() (the Markdown version used elsewhere), which
+      // silently degrades to plain parse_mode MarkdownV2 when the Rich
+      // Message API call is rejected. In a group, if "sendRichMessage" is
+      // ever unavailable/rejected for the placeholder (feature disabled for
+      // that chat, older client, transient Telegram error, ...), the old
+      // code threw immediately — before a single token was generated —
+      // which always landed in the generic catch-all error message, every
+      // single time, for every group message. Give it the same plain-text
+      // fallback the private-chat draft path already has below, instead of
+      // throwing.
+      let placeholder = await sendRichMessageHtml(chatId, thinkingHtml("Thinking"), replyTo, threadExtra(threadId));
+      if (!placeholder?.ok || !placeholder?.result?.message_id) {
+        console.warn(`[group:placeholder-fallback] chat=${chatId} reason=${sanitizeLog(placeholder?.description || "rich message unavailable")}`);
+        placeholder = await sendMessage(chatId, "🤔 Thinking...", replyTo, { markdown: false, extra: threadExtra(threadId) });
+      }
       if (!placeholder?.ok || !placeholder?.result?.message_id) throw new Error("Could not create the Telegram streaming message.");
       streamMessageId = placeholder.result.message_id;
     } else {
@@ -1919,7 +1953,7 @@ function helpBlocks() {
     `Office/PDF: ${SUPPORTED_BINARY_EXTENSIONS.map(e => `.${e}`).join(", ")}`,
     `Max size: ${Math.floor(MAX_DOWNLOAD_BYTES / (1024 * 1024))} MB.`
   ];
-  if (ENABLE_VOICE) mediaBullets.push("Voice messages: send one and I'll transcribe and respond to it.");
+  if (voiceEnabled) mediaBullets.push("Voice messages: send one and I'll transcribe and respond to it.");
 
   return [
     rb.heading("How to use the bot", 3),
@@ -2002,7 +2036,7 @@ function statusBlocks(admin = false) {
       `In-flight queues: ${inFlightQueues.size}`,
       `Active generations: ${activeGenerations.size}`,
       `Active reminders: ${reminders.length}`,
-      `Voice transcription: ${ENABLE_VOICE ? "enabled" : "disabled"}`
+      `Voice transcription: ${voiceEnabled ? "enabled" : "disabled"}`
     ]));
   }
   return blocks;
@@ -2053,16 +2087,47 @@ function modelsKeyboard(canChange) {
   return { inline_keyboard: rows };
 }
 
-function settingsKeyboard() {
+function settingsKeyboard(isAdmin = false) {
+  const rows = [
+    [{ text: "◇ 🧹 Clear memory ◇", callback_data: "settings:clear" }, { text: "◇ 🎭 Show persona ◇", callback_data: "settings:persona" }],
+    [{ text: "◇ 📤 Export history ◇", callback_data: "settings:export" }, { text: "◇ 🤖 Models ◇", callback_data: "settings:models" }]
+  ];
+  if (isAdmin) rows.push([{ text: "✦ 🛠 Admin panel ✦", callback_data: "settings:openadmin" }]);
+  return { inline_keyboard: rows };
+}
+
+const ADMIN_IDS = new Set(String(process.env.ADMIN_IDS || "").split(",").map(v => v.trim()).filter(Boolean));
+
+// ---------------------------------------------------------------------------
+// Admin panel — a single glassy-pill button dashboard (/admin, /dev) that
+// replaces the old plain "dump some stats text" admin command. Every button
+// is either a quick action (toggle voice, refresh catalog, clear cache) that
+// applies instantly and re-renders the panel, or an info button that answers
+// with a popup (answerCallbackQuery show_alert) so it never spams the chat
+// with extra messages. Broadcasting still goes through the /broadcast text
+// command (Telegram has no way to collect free text from an inline button),
+// but the panel button reminds admins how to use it.
+// ---------------------------------------------------------------------------
+
+function isAdminId(userId) { return ADMIN_IDS.has(String(userId)); }
+
+function adminPanelKeyboard() {
+  const voiceLabel = voiceEnabled ? "✅ ✦ Voice: ON ✦" : "◇ 🎙 Voice: OFF ◇";
   return {
     inline_keyboard: [
-      [{ text: "🧹 Clear memory", callback_data: "settings:clear" }, { text: "🎭 Show persona", callback_data: "settings:persona" }],
-      [{ text: "📤 Export history", callback_data: "settings:export" }]
+      [{ text: "◇ 📊 Stats ◇", callback_data: "admin:stats" }, { text: "◇ 👥 Users ◇", callback_data: "admin:users" }],
+      [{ text: "◇ 🤖 Models ◇", callback_data: "admin:models" }, { text: "◇ 🔄 Refresh catalog ◇", callback_data: "admin:refresh" }],
+      [{ text: "◇ ⏰ Reminders ◇", callback_data: "admin:reminders" }, { text: "◇ ⚡ Active jobs ◇", callback_data: "admin:jobs" }],
+      [{ text: voiceLabel, callback_data: "admin:togglevoice" }, { text: "◇ 🎚 Rate limits ◇", callback_data: "admin:ratelimits" }],
+      [{ text: "◇ 🧹 Clear cache ◇", callback_data: "admin:clearcache" }, { text: "◇ 📣 Broadcast ◇", callback_data: "admin:broadcast" }],
+      [{ text: "✖ Close", callback_data: "admin:close" }]
     ]
   };
 }
 
-const ADMIN_IDS = new Set(String(process.env.ADMIN_IDS || "").split(",").map(v => v.trim()).filter(Boolean));
+async function sendAdminPanel(chatId, messageId, threadId) {
+  await sendRichBlocksMessage(chatId, statusBlocks(true), messageId, { reply_markup: adminPanelKeyboard(), ...threadExtra(threadId) });
+}
 
 async function exportHistory(chatId, userId, messageId, threadId) {
   const history = getHistory(userId);
@@ -2153,7 +2218,7 @@ async function command(chatId, userId, text, messageId, fromUser, threadId) {
       return true;
 
     case "/settings":
-      await tg("sendMessage", { chat_id: chatId, text: "⚙️ Quick settings:", reply_markup: settingsKeyboard(), ...(messageId ? { reply_parameters: { message_id: messageId } } : {}), ...threadExtra(threadId) });
+      await tg("sendMessage", { chat_id: chatId, text: "⚙️ Quick settings:", reply_markup: settingsKeyboard(isAdminId(userId)), ...(messageId ? { reply_parameters: { message_id: messageId } } : {}), ...threadExtra(threadId) });
       return true;
 
     case "/status":
@@ -2193,7 +2258,7 @@ async function adminCommand(chatId, userId, text, messageId, threadId) {
   switch (parsed.command) {
     case "/admin":
     case "/dev":
-      await sendRichBlocksMessage(chatId, statusBlocks(true), messageId, threadExtra(threadId));
+      await sendAdminPanel(chatId, messageId, threadId);
       return true;
 
     case "/clearcache":
@@ -2249,6 +2314,135 @@ async function handleCallbackQuery(callbackQuery) {
     await exportHistory(chatId, userId, messageId, threadId);
     return;
   }
+  if (data === "settings:models") {
+    await answerCallbackQuery(callbackQuery.id);
+    const canChange = !ADMIN_IDS.size || isAdminId(userId);
+    await sendRichBlocksMessage(chatId, modelsBlocks(canChange), messageId, { reply_markup: modelsKeyboard(canChange), ...threadExtra(threadId) });
+    return;
+  }
+  if (data === "settings:openadmin") {
+    if (!isAdminId(userId)) { await answerCallbackQuery(callbackQuery.id, "Admins only.", true); return; }
+    await answerCallbackQuery(callbackQuery.id);
+    await sendAdminPanel(chatId, messageId, threadId);
+    return;
+  }
+
+  // -------------------------------------------------------------------
+  // Admin panel button handlers (see adminPanelKeyboard()). Every branch
+  // here is gated by isAdminId() first, even though non-admins can't
+  // normally see the panel — a stale/forwarded callback_data shouldn't be
+  // trusted just because it looks like one of ours.
+  // -------------------------------------------------------------------
+  if (data.startsWith("admin:")) {
+    if (!isAdminId(userId)) { await answerCallbackQuery(callbackQuery.id, "Admins only.", true); return; }
+    const action = data.slice("admin:".length);
+
+    if (action === "close") {
+      await answerCallbackQuery(callbackQuery.id, "Closed.");
+      if (messageId) await tg("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+      return;
+    }
+
+    if (action === "stats") {
+      const uptime = Math.floor((Date.now() - stats.started) / 1000);
+      let userCount = 0;
+      try { userCount = usersCountStmt.get().c; } catch {}
+      const lines = [
+        `Uptime: ${formatUptime(uptime)}`,
+        `Requests: ${stats.requests} | Errors: ${stats.errors} | Cancelled: ${stats.cancellations}`,
+        `Searches: ${stats.searches} (failed ${stats.searchFailures})`,
+        `Links opened: ${stats.urlOpens} (failed ${stats.urlOpenFailures})`,
+        `Images: ${stats.images} | Files: ${stats.files} | Audio: ${stats.audio}`,
+        `Telegram errors: ${stats.telegramErrors} | OpenRouter errors: ${stats.openRouterErrors}`,
+        `Rate-limited: ${stats.rateLimited} | Guest: ${stats.guestRequests} (failed ${stats.guestErrors})`,
+        `Avg first token: ${stats.firstTokenMs.length ? `${avg(stats.firstTokenMs)} ms` : "—"} | Avg total: ${stats.totalMs.length ? `${avg(stats.totalMs)} ms` : "—"}`,
+        `Known users: ${userCount} | Memory entries: ${memory.size}`
+      ];
+      await answerCallbackQuery(callbackQuery.id, lines.join("\n"), true);
+      return;
+    }
+
+    if (action === "users") {
+      let userCount = 0, recent = [];
+      try { userCount = usersCountStmt.get().c; } catch {}
+      try { recent = usersRecentStmt.all(); } catch {}
+      const lines = [`Known users: ${userCount}`, "", "Most recently active:"];
+      for (const row of recent) lines.push(`• ${row.username ? "@" + row.username : row.user_id}`);
+      if (!recent.length) lines.push("(none yet)");
+      await answerCallbackQuery(callbackQuery.id, lines.join("\n"), true);
+      return;
+    }
+
+    if (action === "models") {
+      await answerCallbackQuery(callbackQuery.id);
+      await sendRichBlocksMessage(chatId, modelsBlocks(true), messageId, { reply_markup: modelsKeyboard(true), ...threadExtra(threadId) });
+      return;
+    }
+
+    if (action === "refresh") {
+      await answerCallbackQuery(callbackQuery.id, "Refreshing model catalog…");
+      await fetchModelCatalog(true);
+      await answerCallbackQuery(callbackQuery.id, "✅ Catalog refreshed.");
+      return;
+    }
+
+    if (action === "reminders") {
+      const upcoming = reminders.slice().sort((a, b) => a.due_at - b.due_at).slice(0, 10);
+      const lines = [`Active reminders: ${reminders.length}`, ""];
+      for (const row of upcoming) {
+        const inMs = Math.max(0, row.due_at - Date.now());
+        lines.push(`#${row.id} in ${formatUptime(Math.round(inMs / 1000))} — ${String(row.text).slice(0, 60)}`);
+      }
+      if (!upcoming.length) lines.push("(none scheduled)");
+      await answerCallbackQuery(callbackQuery.id, lines.join("\n"), true);
+      return;
+    }
+
+    if (action === "jobs") {
+      const lines = [
+        `Active generations: ${activeGenerations.size}`,
+        `Queued/in-flight users: ${inFlightQueues.size}`,
+        `Global concurrency: ${activeJobs}/${MAX_GLOBAL_CONCURRENCY} (+${pendingJobs.length} pending)`
+      ];
+      await answerCallbackQuery(callbackQuery.id, lines.join("\n"), true);
+      return;
+    }
+
+    if (action === "togglevoice") {
+      voiceEnabled = !voiceEnabled;
+      console.log(`[admin] voice transcription toggled to ${voiceEnabled} by user=${sanitizeLog(userId)}`);
+      await answerCallbackQuery(callbackQuery.id, `🎙 Voice transcription is now ${voiceEnabled ? "ON" : "OFF"}.`);
+      if (messageId) await tg("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: adminPanelKeyboard() }).catch(() => {});
+      return;
+    }
+
+    if (action === "ratelimits") {
+      const lines = [
+        `Per user: ${RATE_LIMIT_PER_MIN}/min (burst ${RATE_LIMIT_BURST})`,
+        `Max tool rounds: ${MAX_TOOL_ROUNDS} | Max searches/request: ${MAX_SEARCHES}`,
+        `Global concurrency cap: ${MAX_GLOBAL_CONCURRENCY}`,
+        "",
+        "Set RATE_LIMIT_PER_MIN / RATE_LIMIT_BURST / MAX_GLOBAL_CONCURRENCY env vars to change these (requires redeploy)."
+      ];
+      await answerCallbackQuery(callbackQuery.id, lines.join("\n"), true);
+      return;
+    }
+
+    if (action === "clearcache") {
+      clearAllCache();
+      await answerCallbackQuery(callbackQuery.id, "🧹 Cache and in-memory state cleared.");
+      return;
+    }
+
+    if (action === "broadcast") {
+      await answerCallbackQuery(callbackQuery.id, "To broadcast, send:\n/broadcast <message>\n(inline buttons can't collect free text)", true);
+      return;
+    }
+
+    await answerCallbackQuery(callbackQuery.id);
+    return;
+  }
+
   if (data === "model:noop") {
     await answerCallbackQuery(callbackQuery.id, "That's already the primary model.");
     return;
@@ -2452,7 +2646,7 @@ async function handleSingleUpdate(update, message, isEdited) {
   const isImage = photos.length > 0;
   const isDocument = Boolean(message.document);
   const isAudio = Boolean(message.voice || message.audio);
-  const unsupportedMedia = Boolean(message.video || message.animation || message.video_note || message.sticker || message.contact || message.location || message.poll || message.venue || (isAudio && !ENABLE_VOICE));
+  const unsupportedMedia = Boolean(message.video || message.animation || message.video_note || message.sticker || message.contact || message.location || message.poll || message.venue || (isAudio && !voiceEnabled));
   const isPrivate = message.chat.type === "private";
 
   trackUser(userId, chatId, message.from?.username);
@@ -2464,11 +2658,11 @@ async function handleSingleUpdate(update, message, isEdited) {
 
   if (!isPrivate) {
     const targeted = botMentioned(sourceText) || triggerUsed(sourceText) || slashTriggerUsed(sourceText) || repliedToBot(message);
-    if (!targeted && !isImage && !isDocument && !(isAudio && ENABLE_VOICE)) return;
+    if (!targeted && !isImage && !isDocument && !(isAudio && voiceEnabled)) return;
   }
 
   if (unsupportedMedia) {
-    const msg = (isAudio && !ENABLE_VOICE)
+    const msg = (isAudio && !voiceEnabled)
       ? "🎙️ Voice/audio messages aren't enabled on this bot right now."
       : "📝 Type a prompt, send an image, or send a supported document. See /help for the full list.";
     await sendRichBlocksMessage(chatId, [rb.paragraph(msg)], messageId, threadExtra(threadId));
@@ -2508,7 +2702,7 @@ async function handleSingleUpdate(update, message, isEdited) {
   }
 
   let audioObj = null;
-  if (isAudio && ENABLE_VOICE) {
+  if (isAudio && voiceEnabled) {
     stats.audio++;
     try {
       const fileId = message.voice?.file_id || message.audio?.file_id;
