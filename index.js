@@ -2,8 +2,7 @@ import express from "express";
 import { DatabaseSync } from "node:sqlite";
 import fs from "fs";
 import path from "path";
-import { startKeepAlive } from "./keepalive.js";
-startKeepAlive();
+
 // ============================================================================
 // Telegram AI Bot — persistence & reliability edition
 // ============================================================================
@@ -48,10 +47,6 @@ for (const configuredModel of [PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL, SECOND_F
 
 let TEXT_MODEL = PRIMARY_TEXT_MODEL;
 
-// ---------------------------------------------------------------------------
-// NEW: Admins are declared up-front (moved above alertAdmins/usage of it)
-// so we no longer need the TDZ placeholder-guard hack.
-// ---------------------------------------------------------------------------
 const ADMIN_IDS = new Set(String(process.env.ADMIN_IDS || "").split(",").map(v => v.trim()).filter(Boolean));
 function isAdminId(userId) { return ADMIN_IDS.has(String(userId)); }
 
@@ -259,7 +254,6 @@ memoryCleanupTimer.unref?.();
 
 function historyKey(userId) { return `history:${String(userId)}`; }
 function personaKey(userId) { return `persona:${String(userId)}`; }
-// NEW: per-chat model override key
 function chatModelKey(chatId) { return `chatmodel:${String(chatId)}`; }
 
 function getHistory(userId) {
@@ -327,9 +321,9 @@ function setPersona(userId, text) {
 }
 
 // ---------------------------------------------------------------------------
-// NEW: Persona presets — canned personas selectable via inline buttons
-// (/persona list). Free text via /persona <text> still works as before and
-// always overrides a preset.
+// Persona presets — canned personas selectable via inline buttons
+// (/persona list). Free text via /persona <text> still works and always
+// overrides a preset.
 // ---------------------------------------------------------------------------
 const PERSONA_PRESETS = [
   { id: "default", label: "🤖 Default", text: "" },
@@ -340,15 +334,27 @@ const PERSONA_PRESETS = [
   { id: "formal", label: "🎩 Formal & Professional", text: "Respond in a formal, professional register suitable for business communication. Avoid slang, emojis, and casual phrasing." }
 ];
 function findPersonaPreset(id) { return PERSONA_PRESETS.find(p => p.id === id) || null; }
-function personaPresetsKeyboard() {
-  const rows = PERSONA_PRESETS.map(p => [{ text: p.label, callback_data: `persona:${p.id}` }]);
+
+// ---------------------------------------------------------------------------
+// Glassy button styling helper — keeps every inline button consistent
+// ---------------------------------------------------------------------------
+function glassy(label, active = false) {
+  return active ? `✅ ✦ ${label} ✦` : `◇ ${label} ◇`;
+}
+
+function personaPresetsKeyboard(currentUserId) {
+  const current = currentUserId != null ? getPersona(currentUserId) : "";
+  const rows = PERSONA_PRESETS.map(p => {
+    const isActive = p.text === current || (!p.text && !current);
+    return [{ text: glassy(p.label, isActive), callback_data: isActive ? "persona:noop" : `persona:${p.id}` }];
+  });
+  rows.push([{ text: glassy("↩️ Back to settings"), callback_data: "settings:menu" }]);
   return { inline_keyboard: rows };
 }
 
 // ---------------------------------------------------------------------------
-// NEW: Per-chat model override. TEXT_MODEL remains the global default;
-// a chat can override it independently (e.g. a group wants a bigger model
-// while DMs stay on the fast default). Falls back to the global TEXT_MODEL
+// Per-chat model override. TEXT_MODEL remains the global default;
+// a chat can override it independently. Falls back to the global TEXT_MODEL
 // when no override is set for that chat.
 // ---------------------------------------------------------------------------
 function getChatModelOverride(chatId) { return memGet(chatModelKey(chatId)) || ""; }
@@ -551,12 +557,7 @@ async function getMe() {
 }
 
 // ---------------------------------------------------------------------------
-// NEW: setWebhook on startup. Registers PUBLIC_URL + WEBHOOK_PATH with
-// Telegram automatically so a redeploy that rotates WEBHOOK_PATH_TOKEN
-// doesn't silently go dark until someone remembers to call setWebhook by
-// hand. Set PUBLIC_URL to your deployed base URL (e.g.
-// https://my-bot.onrender.com). If PUBLIC_URL is not set, this is skipped
-// and you're expected to manage the webhook manually, same as before.
+// setWebhook on startup.
 // ---------------------------------------------------------------------------
 async function registerWebhook() {
   if (!PUBLIC_URL) { console.log("[webhook] PUBLIC_URL not set — skipping automatic setWebhook (manage it manually)."); return; }
@@ -576,6 +577,7 @@ async function registerCommands() {
   const commands = [
     { command: "start", description: "Show the welcome message" },
     { command: "help", description: "How to use this bot" },
+    { command: "menu", description: "Open a quick button-based menu" },
     { command: "clear", description: "Clear your conversation memory" },
     { command: "persona", description: "Set or view your custom persona" },
     { command: "remind", description: "Set a one-off reminder" },
@@ -1161,10 +1163,6 @@ async function ensureAudioModel(model) {
   return true;
 }
 
-// NEW: chooseModelChain now accepts an optional chatId so per-chat model
-// overrides (see setChatModelOverride/getChatModelOverride above) are
-// respected for text requests. Image/audio/file chains are unaffected —
-// those are dedicated single-purpose models, same as before.
 function chooseModelChain({ image, file, audio, chatId }) {
   if (image) return [VISION_MODEL];
   if (audio) return [AUDIO_MODEL];
@@ -1791,7 +1789,7 @@ async function sendStart(chatId, user, messageId, threadId) {
       "Just type a message to start chatting.",
       "Paste a direct link and I'll open and read that page.",
       "Send a photo (or a whole album) or a document and I'll read it.",
-      "Use /help any time to see everything I can do."
+      "Use /help or /menu any time to see everything I can do."
     ])
   ];
   await sendRichBlocksMessage(chatId, blocks, messageId, threadExtra(threadId));
@@ -1816,7 +1814,8 @@ function helpBlocks() {
       `In a group, mention me, reply to me, or use "${TRIGGER || "!ai"}".`,
       `If "${TRIGGER || "!ai"}" doesn't seem to work in a group, use "${SLASH_TRIGGER}" instead — it works even when the bot's group privacy mode is on.`,
       "I reply in whatever language you write in.",
-      "/cancel — stop the response I'm currently generating for you."
+      "/cancel — stop the response I'm currently generating for you.",
+      "/menu — open a quick button-based menu instead of typing commands."
     ]),
     rb.heading("Memory & persona", 4),
     rb.bulletList([
@@ -1844,7 +1843,7 @@ function helpBlocks() {
       "/usage — your personal usage stats (requests, searches, models used).",
       "/models — active AI models, and switch the primary one.",
     ]),
-    rb.footer("Tip: /help shows this guide again any time.")
+    rb.footer("Tip: /help or /menu shows this guide / quick menu again any time.")
   ];
 }
 
@@ -1890,9 +1889,6 @@ function statusBlocks(admin = false) {
   return blocks;
 }
 
-// NEW: /usage — a regular (non-admin) user can see their own request count,
-// searches used, and which models they've been served by, pulled straight
-// from the usage table already being written in recordUsage().
 function usageBlocks(userId) {
   const row = getUsage(userId);
   if (!row) return [rb.paragraph("You haven't made any requests yet — send me a message to get started!")];
@@ -1944,30 +1940,42 @@ function modelsBlocks(canChange, chatId) {
   ];
 }
 
-// NEW: model buttons now write a per-chat override (via callback_data
-// "model:<index>:<chatId>") instead of always changing the single global
-// TEXT_MODEL, so different chats can run different primary models.
 function modelsKeyboard(canChange, chatId) {
   const override = chatId != null ? getChatModelOverride(chatId) : "";
   const active = override || TEXT_MODEL;
   const rows = FREE_MODELS.map((model, index) => {
     const isActive = model.id === active;
-    const label = isActive ? `✅ ✦ ${model.label} ✦` : `◇ ${model.label} ◇`;
-    return [{ text: label, callback_data: isActive ? "model:noop" : `model:${index}:${chatId}` }];
+    return [{ text: glassy(model.label, isActive), callback_data: isActive ? "model:noop" : `model:${index}:${chatId}` }];
   });
-  if (override) rows.push([{ text: "↩️ Reset to global default", callback_data: `model:reset:${chatId}` }]);
-  if (canChange) rows.push([{ text: "🔄 Refresh catalog", callback_data: "model:refresh" }]);
+  if (override) rows.push([{ text: glassy("↩️ Reset to global default"), callback_data: `model:reset:${chatId}` }]);
+  if (canChange) rows.push([{ text: glassy("🔄 Refresh catalog"), callback_data: "model:refresh" }]);
+  rows.push([{ text: glassy("↩️ Back to settings"), callback_data: "settings:menu" }]);
   return { inline_keyboard: rows };
 }
 
 function settingsKeyboard(isAdmin = false) {
   const rows = [
-    [{ text: "◇ 🧹 Clear memory ◇", callback_data: "settings:clear" }, { text: "◇ 🎭 Show persona ◇", callback_data: "settings:persona" }],
-    [{ text: "◇ 📤 Export history ◇", callback_data: "settings:export" }, { text: "◇ 🤖 Models ◇", callback_data: "settings:models" }],
-    [{ text: "◇ 🎭 Persona presets ◇", callback_data: "settings:personapresets" }, { text: "◇ 📈 My usage ◇", callback_data: "settings:usage" }]
+    [{ text: glassy("🧹 Clear memory"), callback_data: "settings:clear" }, { text: glassy("🎭 Show persona"), callback_data: "settings:persona" }],
+    [{ text: glassy("📤 Export history"), callback_data: "settings:export" }, { text: glassy("🤖 Models"), callback_data: "settings:models" }],
+    [{ text: glassy("🎭 Persona presets"), callback_data: "settings:personapresets" }, { text: glassy("📈 My usage"), callback_data: "settings:usage" }],
+    [{ text: glassy("❓ Help"), callback_data: "settings:help" }, { text: glassy("📊 Status"), callback_data: "settings:status" }]
   ];
-  if (isAdmin) rows.push([{ text: "✦ 🛠 Admin panel ✦", callback_data: "settings:openadmin" }]);
+  if (isAdmin) rows.push([{ text: `✦ 🛠 Admin panel ✦`, callback_data: "settings:openadmin" }]);
   return { inline_keyboard: rows };
+}
+
+// ---------------------------------------------------------------------------
+// Quick button-based menu for regular (non-admin) users — /menu
+// ---------------------------------------------------------------------------
+function userMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: glassy("❓ Help"), callback_data: "menu:help" }, { text: glassy("📊 Status"), callback_data: "menu:status" }],
+      [{ text: glassy("📈 My usage"), callback_data: "menu:usage" }, { text: glassy("🤖 Models"), callback_data: "menu:models" }],
+      [{ text: glassy("🧹 Clear memory"), callback_data: "menu:clear" }, { text: glassy("🎭 Persona"), callback_data: "menu:personapresets" }],
+      [{ text: glassy("⚙️ Full settings"), callback_data: "menu:settings" }]
+    ]
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1975,15 +1983,15 @@ function settingsKeyboard(isAdmin = false) {
 // ---------------------------------------------------------------------------
 
 function adminPanelKeyboard() {
-  const voiceLabel = voiceEnabled ? "✅ ✦ Voice: ON ✦" : "◇ 🎙 Voice: OFF ◇";
+  const voiceLabel = glassy(`🎙 Voice: ${voiceEnabled ? "ON" : "OFF"}`, voiceEnabled);
   return {
     inline_keyboard: [
-      [{ text: "◇ 📊 Stats ◇", callback_data: "admin:stats" }, { text: "◇ 👥 Users ◇", callback_data: "admin:users" }],
-      [{ text: "◇ 🤖 Models ◇", callback_data: "admin:models" }, { text: "◇ 🔄 Refresh catalog ◇", callback_data: "admin:refresh" }],
-      [{ text: "◇ ⏰ Reminders ◇", callback_data: "admin:reminders" }, { text: "◇ ⚡ Active jobs ◇", callback_data: "admin:jobs" }],
-      [{ text: voiceLabel, callback_data: "admin:togglevoice" }, { text: "◇ 🎚 Rate limits ◇", callback_data: "admin:ratelimits" }],
-      [{ text: "◇ 🧹 Clear cache ◇", callback_data: "admin:clearcache" }, { text: "◇ 📣 Broadcast ◇", callback_data: "admin:broadcast" }],
-      [{ text: "◇ 📦 Backup DB ◇", callback_data: "admin:backup" }],
+      [{ text: glassy("📊 Stats"), callback_data: "admin:stats" }, { text: glassy("👥 Users"), callback_data: "admin:users" }],
+      [{ text: glassy("🤖 Models"), callback_data: "admin:models" }, { text: glassy("🔄 Refresh catalog"), callback_data: "admin:refresh" }],
+      [{ text: glassy("⏰ Reminders"), callback_data: "admin:reminders" }, { text: glassy("⚡ Active jobs"), callback_data: "admin:jobs" }],
+      [{ text: voiceLabel, callback_data: "admin:togglevoice" }, { text: glassy("🎚 Rate limits"), callback_data: "admin:ratelimits" }],
+      [{ text: glassy("🧹 Clear cache"), callback_data: "admin:clearcache" }, { text: glassy("📣 Broadcast"), callback_data: "admin:broadcast" }],
+      [{ text: glassy("📦 Backup DB"), callback_data: "admin:backup" }],
       [{ text: "✖ Close", callback_data: "admin:close" }]
     ]
   };
@@ -1993,11 +2001,6 @@ async function sendAdminPanel(chatId, messageId, threadId) {
   await sendRichBlocksMessage(chatId, statusBlocks(true), messageId, { reply_markup: adminPanelKeyboard(), ...threadExtra(threadId) });
 }
 
-// NEW: sends the live SQLite DB file to the requesting admin as a document,
-// so there's a one-tap backup path instead of needing shell/SSH access to
-// the deploy host. Uses WAL checkpoint first so the on-disk file reflects
-// the latest writes (WAL mode can otherwise leave recent data only in the
-// -wal sidecar file).
 async function backupDatabase(chatId, messageId, threadId) {
   try {
     try { db.exec("PRAGMA wal_checkpoint(FULL);"); } catch (error) { console.warn(`[backup:checkpoint-warn] ${sanitizeLog(error?.message || error)}`); }
@@ -2040,6 +2043,10 @@ async function command(chatId, userId, text, messageId, fromUser, threadId) {
       await sendRichBlocksMessage(chatId, helpBlocks(), messageId, threadExtra(threadId));
       return true;
 
+    case "/menu":
+      await tg("sendMessage", { chat_id: chatId, text: "✦ Quick menu ✦", reply_markup: userMenuKeyboard(), ...(messageId ? { reply_parameters: { message_id: messageId } } : {}), ...threadExtra(threadId) });
+      return true;
+
     case "/clear":
     case "/clearmemory":
       clearUserMemory(userId);
@@ -2072,7 +2079,7 @@ async function command(chatId, userId, text, messageId, fromUser, threadId) {
         return true;
       }
       if (/^list$/i.test(parsed.arg)) {
-        await tg("sendMessage", { chat_id: chatId, text: "🎭 Pick a persona preset:", reply_markup: personaPresetsKeyboard(), ...(messageId ? { reply_parameters: { message_id: messageId } } : {}), ...threadExtra(threadId) });
+        await tg("sendMessage", { chat_id: chatId, text: "🎭 Pick a persona preset:", reply_markup: personaPresetsKeyboard(userId), ...(messageId ? { reply_parameters: { message_id: messageId } } : {}), ...threadExtra(threadId) });
         return true;
       }
       const saved = setPersona(userId, parsed.arg);
@@ -2129,6 +2136,39 @@ async function command(chatId, userId, text, messageId, fromUser, threadId) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Broadcast "arm" mode: since inline buttons can't collect free text, tapping
+// the broadcast button arms a one-shot capture so the admin's very next
+// message in that chat is used as the broadcast text (instead of requiring
+// them to type "/broadcast <message>").
+// ---------------------------------------------------------------------------
+const armedBroadcast = new Map(); // key: adminUserId -> expiresAt
+
+function armBroadcast(userId) {
+  armedBroadcast.set(String(userId), Date.now() + 5 * 60 * 1000);
+}
+function consumeArmedBroadcast(userId) {
+  const key = String(userId), expiresAt = armedBroadcast.get(key);
+  if (!expiresAt) return false;
+  armedBroadcast.delete(key);
+  return expiresAt > Date.now();
+}
+
+async function runBroadcast(chatId, messageId, threadId, text) {
+  let rows = [];
+  try { rows = usersDistinctChatsStmt.all(); } catch (error) { console.error(`[broadcast:db:error] ${sanitizeLog(error?.message || error)}`); }
+  await sendRichBlocksMessage(chatId, [rb.paragraph(`📣 Broadcasting to ${rows.length} chat(s)…`)], messageId, threadExtra(threadId));
+  let sent = 0, failed = 0;
+  for (const row of rows) {
+    try {
+      const result = await sendRichMessage(row.chat_id, text, undefined);
+      if (result.ok) sent++; else failed++;
+    } catch { failed++; }
+    await sleep(60);
+  }
+  await sendRichBlocksMessage(chatId, [rb.paragraph(`✅ Broadcast done: ${sent} sent, ${failed} failed.`)], messageId, threadExtra(threadId));
+}
+
 async function adminCommand(chatId, userId, text, messageId, threadId) {
   if (!isAdminId(userId)) return false;
   const parsed = parseCommand(text);
@@ -2151,21 +2191,10 @@ async function adminCommand(chatId, userId, text, messageId, threadId) {
 
     case "/broadcast": {
       if (!parsed.arg) {
-        await sendRichBlocksMessage(chatId, [rb.paragraph("Usage: /broadcast <message>")], messageId, threadExtra(threadId));
+        await sendRichBlocksMessage(chatId, [rb.paragraph("Usage: /broadcast <message>\n\nOr tap 📣 Broadcast in /admin and just send your message next.")], messageId, threadExtra(threadId));
         return true;
       }
-      let rows = [];
-      try { rows = usersDistinctChatsStmt.all(); } catch (error) { console.error(`[broadcast:db:error] ${sanitizeLog(error?.message || error)}`); }
-      await sendRichBlocksMessage(chatId, [rb.paragraph(`📣 Broadcasting to ${rows.length} chat(s)…`)], messageId, threadExtra(threadId));
-      let sent = 0, failed = 0;
-      for (const row of rows) {
-        try {
-          const result = await sendRichMessage(row.chat_id, parsed.arg, undefined);
-          if (result.ok) sent++; else failed++;
-        } catch { failed++; }
-        await sleep(60);
-      }
-      await sendRichBlocksMessage(chatId, [rb.paragraph(`✅ Broadcast done: ${sent} sent, ${failed} failed.`)], messageId, threadExtra(threadId));
+      await runBroadcast(chatId, messageId, threadId, parsed.arg);
       return true;
     }
 
@@ -2182,6 +2211,31 @@ async function handleCallbackQuery(callbackQuery) {
   const threadId = callbackQuery?.message?.message_thread_id;
   if (!chatId) return;
 
+  // -----------------------------------------------------------------
+  // Quick user menu (/menu)
+  // -----------------------------------------------------------------
+  if (data.startsWith("menu:")) {
+    const action = data.slice("menu:".length);
+    if (action === "help") { await answerCallbackQuery(callbackQuery.id); await sendRichBlocksMessage(chatId, helpBlocks(), messageId, threadExtra(threadId)); return; }
+    if (action === "status") { await answerCallbackQuery(callbackQuery.id); await sendRichBlocksMessage(chatId, statusBlocks(false), messageId, threadExtra(threadId)); return; }
+    if (action === "usage") { await answerCallbackQuery(callbackQuery.id); await sendRichBlocksMessage(chatId, usageBlocks(userId), messageId, threadExtra(threadId)); return; }
+    if (action === "models") {
+      await answerCallbackQuery(callbackQuery.id);
+      const canChange = !ADMIN_IDS.size || isAdminId(userId);
+      await sendRichBlocksMessage(chatId, modelsBlocks(canChange, chatId), messageId, { reply_markup: modelsKeyboard(canChange, chatId), ...threadExtra(threadId) });
+      return;
+    }
+    if (action === "clear") { clearUserMemory(userId); await answerCallbackQuery(callbackQuery.id, "Memory cleared ✅"); return; }
+    if (action === "personapresets") { await answerCallbackQuery(callbackQuery.id); await tg("sendMessage", { chat_id: chatId, text: "🎭 Pick a persona preset:", reply_markup: personaPresetsKeyboard(userId), ...threadExtra(threadId) }); return; }
+    if (action === "settings") { await answerCallbackQuery(callbackQuery.id); await tg("sendMessage", { chat_id: chatId, text: "⚙️ Quick settings:", reply_markup: settingsKeyboard(isAdminId(userId)), ...threadExtra(threadId) }); return; }
+    await answerCallbackQuery(callbackQuery.id);
+    return;
+  }
+
+  if (data === "settings:menu") { await answerCallbackQuery(callbackQuery.id); await tg("sendMessage", { chat_id: chatId, text: "⚙️ Quick settings:", reply_markup: settingsKeyboard(isAdminId(userId)), ...threadExtra(threadId) }); return; }
+  if (data === "settings:help") { await answerCallbackQuery(callbackQuery.id); await sendRichBlocksMessage(chatId, helpBlocks(), messageId, threadExtra(threadId)); return; }
+  if (data === "settings:status") { await answerCallbackQuery(callbackQuery.id); await sendRichBlocksMessage(chatId, statusBlocks(false), messageId, threadExtra(threadId)); return; }
+
   if (data === "settings:clear") {
     clearUserMemory(userId);
     await answerCallbackQuery(callbackQuery.id, "Memory cleared ✅");
@@ -2194,7 +2248,7 @@ async function handleCallbackQuery(callbackQuery) {
   }
   if (data === "settings:personapresets") {
     await answerCallbackQuery(callbackQuery.id);
-    await tg("sendMessage", { chat_id: chatId, text: "🎭 Pick a persona preset:", reply_markup: personaPresetsKeyboard(), ...threadExtra(threadId) });
+    await tg("sendMessage", { chat_id: chatId, text: "🎭 Pick a persona preset:", reply_markup: personaPresetsKeyboard(userId), ...threadExtra(threadId) });
     return;
   }
   if (data === "settings:usage") {
@@ -2221,8 +2275,12 @@ async function handleCallbackQuery(callbackQuery) {
   }
 
   // -----------------------------------------------------------------
-  // Persona preset selection (from /persona list or settings menu)
+  // Persona preset selection (from /persona list or settings/menu)
   // -----------------------------------------------------------------
+  if (data === "persona:noop") {
+    await answerCallbackQuery(callbackQuery.id, "That's already your active persona.");
+    return;
+  }
   if (data.startsWith("persona:")) {
     const presetId = data.slice("persona:".length);
     const preset = findPersonaPreset(presetId);
@@ -2334,7 +2392,8 @@ async function handleCallbackQuery(callbackQuery) {
     }
 
     if (action === "broadcast") {
-      await answerCallbackQuery(callbackQuery.id, "To broadcast, send:\n/broadcast <message>\n(inline buttons can't collect free text)", true);
+      armBroadcast(userId);
+      await answerCallbackQuery(callbackQuery.id, "📣 Send your broadcast message now (next message you send here will be broadcast). Expires in 5 min.", true);
       return;
     }
 
@@ -2375,7 +2434,6 @@ async function handleCallbackQuery(callbackQuery) {
       await answerCallbackQuery(callbackQuery.id, "Only admins can change the primary model.", true);
       return;
     }
-    // format: model:<index>:<chatId>
     const rest = data.slice("model:".length);
     const [indexStr, targetChatIdStr] = rest.split(":");
     const index = Number(indexStr);
@@ -2532,6 +2590,14 @@ async function handleSingleUpdate(update, message, isEdited) {
   const isPrivate = message.chat.type === "private";
 
   trackUser(userId, chatId, message.from?.username);
+
+  // Broadcast-armed capture: if this admin tapped "📣 Broadcast" and this is
+  // their next plain-text message, treat it as the broadcast content instead
+  // of a normal chat prompt.
+  if (!isEdited && isPrivate && isAdminId(userId) && text && !text.startsWith("/") && consumeArmedBroadcast(userId)) {
+    await runBroadcast(chatId, messageId, threadId, text.slice(0, MAX_USER_PROMPT_CHARS));
+    return;
+  }
 
   if (!isEdited) {
     if (await adminCommand(chatId, userId, text, messageId, threadId)) return;
