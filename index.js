@@ -2,7 +2,8 @@ import express from "express";
 import { DatabaseSync } from "node:sqlite";
 import fs from "fs";
 import path from "path";
-
+import { startKeepAlive } from "./keepalive.js";
+startKeepAlive();
 // ============================================================================
 // Telegram AI Bot — persistence & reliability edition
 // ============================================================================
